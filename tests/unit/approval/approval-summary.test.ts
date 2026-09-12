@@ -225,8 +225,10 @@ describe("buildApprovalMessage", () => {
     expect(message).not.toContain("éé");
   });
 
-  it("summarizes large base64_content", () => {
-    const content = Buffer.alloc(150_000, 7).toString("base64");
+  it.each([
+    ["small", Buffer.from("binary bytes").toString("base64")],
+    ["large", Buffer.alloc(150_000, 7).toString("base64")],
+  ])("summarizes %s base64_content", (_label, content) => {
     const hash = createHash("sha256").update(content, "utf8").digest("hex");
     const message = buildApprovalMessage({
       ...base,
@@ -238,6 +240,7 @@ describe("buildApprovalMessage", () => {
       '- file_name: "a.pdf"',
       `- base64_content: <string: ${content.length} characters, SHA-256 ${hash}>`,
     ]);
+    expect(message).not.toContain(`"${content}"`);
     expect(message.length).toBeLessThan(2_000);
   });
 

@@ -31,9 +31,10 @@ const UNSAFE_CHARACTER = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu;
 const PLAIN_KEY = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
 const FILE_REFERENCE_KEYS = ["file_path", "file_url"];
 // QuickBooks text fields hold at most about 4,000 characters, so ordinary text
-// stays fully visible; longer strings (such as base64 file content) are shown
-// by length and hash, and the payload hash still covers the full value.
+// stays fully visible. Inline binary content and longer strings are shown by
+// length and hash, while the payload hash still covers the full value.
 const MAX_DISPLAYED_STRING_LENGTH = 4_096;
+const BINARY_CONTENT_KEYS = new Set(["base64_content"]);
 
 export function buildApprovalMessage(input: ApprovalMessageInput): string {
   const entity = input.toolName
@@ -81,7 +82,7 @@ function appendSection(lines: string[], heading: string, leaves: Leaf[]): void {
   if (leaves.length === 0) return;
   lines.push("", heading);
   for (const leaf of leaves) {
-    lines.push(`- ${escapeUnsafe(displayPath(leaf.path))}: ${escapeUnsafe(renderValue(leaf.value))}`);
+    lines.push(`- ${escapeUnsafe(displayPath(leaf.path))}: ${escapeUnsafe(renderValue(leaf))}`);
   }
 }
 
@@ -126,11 +127,14 @@ function displayPath(path: string): string {
   return path.startsWith("params[") ? path.slice("params".length) : path;
 }
 
-function renderValue(value: unknown): string {
-  if (typeof value === "string" && value.length > MAX_DISPLAYED_STRING_LENGTH) {
-    return `<string: ${value.length} characters, SHA-256 ${sha256Hex(value)}>`;
+function renderValue(leaf: Leaf): string {
+  if (
+    typeof leaf.value === "string" &&
+    (leaf.value.length > MAX_DISPLAYED_STRING_LENGTH || BINARY_CONTENT_KEYS.has(lastKey(leaf)))
+  ) {
+    return `<string: ${leaf.value.length} characters, SHA-256 ${sha256Hex(leaf.value)}>`;
   }
-  return JSON.stringify(value) ?? String(value);
+  return JSON.stringify(leaf.value) ?? String(leaf.value);
 }
 
 function escapeUnsafe(text: string): string {

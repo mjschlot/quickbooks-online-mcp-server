@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Approvals bind the realm ID the QuickBooks client will use, re-checked before execution, and for `create_attachable` the SHA-256 of the file content, which is read or downloaded into memory before the prompt and uploaded from that snapshot.
 - Optional JSON Lines audit log for approval-mode calls (`QUICKBOOKS_APPROVAL_AUDIT_LOG`, `QUICKBOOKS_APPROVAL_AUDIT_LOG_PATH`), recording outcomes and a payload hash rather than arguments; `error` text has credentials and argument string values of 6 or more characters redacted.
 - In `approval` mode, `create_attachable` downloads `file_url` content (a GET to that URL, no QuickBooks request) before the prompt; cancelling the tool call aborts the download.
-- Approval prompts show strings longer than 4,096 characters (such as `base64_content`) as their length and SHA-256; the payload hash still covers the full value.
+- Approval prompts always show inline `base64_content`, and any other string longer than 4,096 characters, as its length and SHA-256; the payload hash still covers the full value.
 - Audit records for `unsupported-client` outcomes and argument canonicalization failures have `payloadHash` and `realmId` set to `null`.
 
 ### Changed
