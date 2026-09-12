@@ -7,6 +7,8 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import open from 'open';
+import { APPROVAL_ENV } from '../approval/approval-config.js';
+import { MODE_ENV } from '../helpers/register-tool.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -38,7 +40,22 @@ const TOKEN_STORE_PATH =
 // empty-string placeholders a host app (e.g. Claude Desktop) may inject via
 // its env config. This prevents the server from starting with blank
 // REFRESH_TOKEN / REALM_ID even when the host config has those keys set to "".
+//
+// Mutation-policy variables are the exception: an operator who sets one in the
+// host env must not have it silently replaced by a writable token store, so a
+// conflicting value there refuses startup instead of winning.
+const POLICY_ENV_KEYS = [...Object.values(MODE_ENV), ...Object.values(APPROVAL_ENV)];
+const hostPolicyEnv = new Map(POLICY_ENV_KEYS.map((key) => [key, process.env[key]]));
 dotenv.config({ path: TOKEN_STORE_PATH, override: true });
+const conflictingPolicyKeys = POLICY_ENV_KEYS.filter((key) => {
+  const hostValue = hostPolicyEnv.get(key);
+  return Boolean(hostValue?.trim()) && process.env[key] !== hostValue;
+});
+if (conflictingPolicyKeys.length > 0) {
+  throw Error(
+    `Mutation policy variable(s) ${conflictingPolicyKeys.join(', ')} set in the host environment differ from the token store file ${TOKEN_STORE_PATH}; set each in only one location.`
+  );
+}
 
 // Register once at module level — registering inside startOAuthFlow() would
 // accumulate duplicate handlers on every OAuth call.
