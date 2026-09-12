@@ -10,8 +10,9 @@ import {
   type ServerRequest,
 } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
+import { QuickbooksClient } from "../clients/quickbooks-client.js";
 import type { MutationCategory } from "../helpers/register-tool.js";
-import type { ToolDefinition } from "../types/tool-definition.js";
+import type { PreparedApproval, ToolDefinition } from "../types/tool-definition.js";
 import type { ApprovalConfig } from "./approval-config.js";
 import { sanitizeErrorMessage, writeAuditEvent, type AuditEvent, type AuditOutcome } from "./approval-audit.js";
 import { approvalStore, type ApprovalStore, type ConsumeFailure } from "./approval-store.js";
@@ -19,6 +20,10 @@ import { buildApprovalMessage } from "./approval-summary.js";
 import { canonicalJson, sha256Hex } from "./canonicalize.js";
 
 type Extra = RequestHandlerExtra<ServerRequest, ServerNotification>;
+
+type AnyToolDefinition = ToolDefinition<z.ZodType<any, any>>;
+
+type Pinned = { prepared: PreparedApproval | null };
 
 type DenialOutcome = Exclude<AuditOutcome, "requested" | "approved" | "executed" | "execution-failed">;
 
@@ -49,20 +54,43 @@ const APPROVAL_SCHEMA: ElicitRequestFormParams["requestedSchema"] = {
   required: ["approve"],
 };
 
+interface ApprovalDeps {
+  store?: ApprovalStore;
+  now?: () => number;
+  /** The realm the handler's QuickBooks requests will target; may authenticate. */
+  realmId?: () => Promise<string>;
+}
+
+interface CallEnvironment {
+  server: McpServer;
+  definition: AnyToolDefinition;
+  config: ApprovalConfig;
+  store: ApprovalStore;
+  now: () => number;
+  realmId: () => Promise<string>;
+}
+
 /**
  * Wraps a mutation handler so it runs at most once per call, and only after
- * the connected client's user explicitly approves the exact canonical payload.
+ * the connected client's user explicitly approves the exact canonical payload,
+ * the QuickBooks realm it will target, and any external inputs the tool pins.
  * Every failure before execution is a denial; none leads to execution.
  */
 export function createApprovalHandler(
   server: McpServer,
-  definition: ToolDefinition<z.ZodType<any, any>>,
+  definition: AnyToolDefinition,
   category: MutationCategory,
   config: ApprovalConfig,
-  deps: { store?: ApprovalStore; now?: () => number } = {}
-): ToolDefinition<z.ZodType<any, any>>["handler"] {
-  const store = deps.store ?? approvalStore;
-  const now = deps.now ?? Date.now;
+  deps: ApprovalDeps = {}
+): AnyToolDefinition["handler"] {
+  const env: CallEnvironment = {
+    server,
+    definition,
+    config,
+    store: deps.store ?? approvalStore,
+    now: deps.now ?? Date.now,
+    realmId: deps.realmId ?? QuickbooksClient.getRealmId,
+  };
 
   return async (args: unknown, extra: Extra): Promise<CallToolResult> => {
     const context: AuditContext = {
@@ -72,54 +100,67 @@ export function createApprovalHandler(
       payloadHash: null,
       realmId: null,
     };
-
-    let decision: Decision;
+    const pinned: Pinned = { prepared: null };
     try {
-      decision = await obtainApproval(server, context, config, store, now, args, extra);
-    } catch (err) {
-      decision = {
-        approved: false,
-        outcome: "approval-error",
-        reason: "an internal approval error occurred",
-        error: sanitizeErrorMessage(err),
-      };
+      return await approveAndExecute(env, context, pinned, args, extra);
+    } finally {
+      if (pinned.prepared !== null) await disposeOrReport(pinned.prepared, context);
     }
-
-    if (!decision.approved) return deny(config, context, decision);
-
-    let result: CallToolResult;
-    try {
-      result = await definition.handler(JSON.parse(decision.argsJson), extra);
-    } catch (err) {
-      writeAuditOrReport(config, { ...context, outcome: "execution-failed", error: sanitizeErrorMessage(err) });
-      throw err;
-    }
-
-    const failureText = executionFailureText(result);
-    if (failureText === null) {
-      writeAuditOrReport(config, { ...context, outcome: "executed", entityId: extractEntityId(result) });
-    } else {
-      writeAuditOrReport(config, { ...context, outcome: "execution-failed", error: sanitizeErrorMessage(failureText) });
-    }
-    return result;
   };
 }
 
-async function obtainApproval(
-  server: McpServer,
+async function approveAndExecute(
+  env: CallEnvironment,
   context: AuditContext,
-  config: ApprovalConfig,
-  store: ApprovalStore,
-  now: () => number,
+  pinned: Pinned,
+  args: unknown,
+  extra: Extra
+): Promise<CallToolResult> {
+  const { config } = env;
+  let decision: Decision;
+  try {
+    decision = await obtainApproval(env, context, pinned, args, extra);
+  } catch (err) {
+    decision = {
+      approved: false,
+      outcome: "approval-error",
+      reason: "an internal approval error occurred",
+      error: sanitizeErrorMessage(err),
+    };
+  }
+
+  if (!decision.approved) return deny(config, context, decision);
+
+  const handler = pinned.prepared?.handler ?? env.definition.handler;
+  let result: CallToolResult;
+  try {
+    result = await handler(JSON.parse(decision.argsJson), extra);
+  } catch (err) {
+    writeAuditOrReport(config, { ...context, outcome: "execution-failed", error: sanitizeErrorMessage(err) });
+    throw err;
+  }
+
+  const failureText = executionFailureText(result);
+  if (failureText === null) {
+    writeAuditOrReport(config, { ...context, outcome: "executed", entityId: extractEntityId(result) });
+  } else {
+    writeAuditOrReport(config, { ...context, outcome: "execution-failed", error: sanitizeErrorMessage(failureText) });
+  }
+  return result;
+}
+
+async function obtainApproval(
+  env: CallEnvironment,
+  context: AuditContext,
+  pinned: Pinned,
   args: unknown,
   extra: Extra
 ): Promise<Decision> {
-  context.realmId = process.env.QUICKBOOKS_REALM_ID?.trim() || null;
+  const { server, definition, config, store, now } = env;
 
   let argsJson: string;
   try {
     argsJson = canonicalJson(args);
-    context.payloadHash = payloadHashOf(context, args);
   } catch (err) {
     return denial("approval-error", "the tool arguments could not be canonicalized", err);
   }
@@ -131,6 +172,36 @@ async function obtainApproval(
     );
   }
 
+  try {
+    context.realmId = await env.realmId();
+  } catch (err) {
+    return denial("approval-error", "the QuickBooks company (realm) ID could not be determined", err);
+  }
+
+  if (definition.prepareApproval) {
+    try {
+      pinned.prepared = await definition.prepareApproval(JSON.parse(argsJson), extra.signal);
+    } catch (err) {
+      if (extra.signal.aborted) {
+        return denial("canceled", "the tool call was canceled while its external input was being pinned", err);
+      }
+      const error = sanitizeErrorMessage(err);
+      return { approved: false, outcome: "approval-error", reason: `the tool's external input could not be pinned for approval (${error})`, error };
+    }
+  }
+  if (extra.signal.aborted) {
+    return denial("canceled", "the tool call was canceled while its external input was being pinned");
+  }
+  const facts = pinned.prepared?.facts;
+
+  try {
+    context.payloadHash = payloadHashOf(context, JSON.parse(argsJson), facts);
+  } catch (err) {
+    return denial("approval-error", "the pinned input facts could not be canonicalized", err);
+  }
+
+  // Issued only after the realm lookup and pinning, so authentication and
+  // downloads do not consume the user's approval window.
   const record = store.issue({
     toolName: context.toolName,
     category: context.category,
@@ -155,6 +226,7 @@ async function obtainApproval(
           category: context.category,
           args: JSON.parse(argsJson),
           realmId: context.realmId,
+          pinned: facts,
           approvalId: record.id,
           payloadHash: context.payloadHash,
           expiresAt: record.expiresAt,
@@ -193,11 +265,23 @@ async function obtainApproval(
       return denial("approval-error", "the client returned an unrecognized approval response");
   }
 
+  // Re-checked before consuming or auditing "approved": authentication during
+  // the prompt (e.g. an interactive OAuth flow) can switch the company.
+  let currentRealmId: string;
+  try {
+    currentRealmId = await env.realmId();
+  } catch (err) {
+    return denial("approval-error", "the QuickBooks company (realm) ID could not be re-checked before execution", err);
+  }
+  if (currentRealmId !== context.realmId) {
+    return denial("hash-mismatch", "the QuickBooks company changed after approval");
+  }
+
   if (extra.signal.aborted) {
     return denial("canceled", "the tool call was canceled before execution");
   }
 
-  const consumed = store.consume(record.id, context.toolName, payloadHashOf(context, JSON.parse(argsJson)));
+  const consumed = store.consume(record.id, context.toolName, payloadHashOf(context, JSON.parse(argsJson), facts));
   if (!consumed.ok) {
     const { outcome, reason } = CONSUME_DENIAL[consumed.reason];
     return denial(outcome, reason);
@@ -212,13 +296,15 @@ async function obtainApproval(
   return { approved: true, argsJson };
 }
 
-function payloadHashOf(context: AuditContext, args: unknown): string {
+/** `pinned` is omitted from the hashed object when the tool has no prepare hook, so those hashes are unaffected. */
+function payloadHashOf(context: AuditContext, args: unknown, pinned: PreparedApproval["facts"] | undefined): string {
   return sha256Hex(
     canonicalJson({
       toolName: context.toolName,
       category: context.category,
       realmId: context.realmId,
       arguments: args,
+      ...(pinned === undefined ? {} : { pinned }),
     })
   );
 }
@@ -255,6 +341,17 @@ function writeAuditOrReport(config: ApprovalConfig, event: AuditEvent): void {
   } catch (err) {
     console.error(
       `QuickBooks approval audit write failed (${event.outcome}, approval ${event.approvalId ?? "n/a"}): ${sanitizeErrorMessage(err)}`
+    );
+  }
+}
+
+/** A cleanup failure must not change the call's result, so it is reported on stderr. */
+async function disposeOrReport(prepared: PreparedApproval, context: AuditContext): Promise<void> {
+  try {
+    await prepared.dispose();
+  } catch (err) {
+    console.error(
+      `QuickBooks approval pinned input cleanup failed (approval ${context.approvalId ?? "n/a"}): ${sanitizeErrorMessage(err)}`
     );
   }
 }

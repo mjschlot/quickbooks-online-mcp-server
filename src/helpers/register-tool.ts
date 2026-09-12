@@ -3,6 +3,7 @@ import { ToolDefinition } from "../types/tool-definition.js";
 import { z } from "zod";
 import { loadApprovalConfig } from "../approval/approval-config.js";
 import { createApprovalHandler } from "../approval/approval-handler.js";
+import { MODE_ENV, normalizeModeValue } from "../approval/policy-env.js";
 
 /**
  * Defines CRUD categories for tools
@@ -30,12 +31,6 @@ export const DISABLE_ENV = {
   [CRUD_CATEGORY.WRITE]:  "QUICKBOOKS_DISABLE_WRITE",
   [CRUD_CATEGORY.UPDATE]: "QUICKBOOKS_DISABLE_UPDATE",
   [CRUD_CATEGORY.DELETE]: "QUICKBOOKS_DISABLE_DELETE",
-} as const;
-
-export const MODE_ENV = {
-  [CRUD_CATEGORY.WRITE]:  "QUICKBOOKS_WRITE_MODE",
-  [CRUD_CATEGORY.UPDATE]: "QUICKBOOKS_UPDATE_MODE",
-  [CRUD_CATEGORY.DELETE]: "QUICKBOOKS_DELETE_MODE",
 } as const;
 
 /**
@@ -81,9 +76,9 @@ export function resolveMutationMode(
   env: NodeJS.ProcessEnv = process.env
 ): MutationMode {
   const variable = MODE_ENV[category];
-  const raw = env[variable]?.trim().toLowerCase();
-  if (raw) {
-    const mode = MUTATION_MODES.find((candidate) => candidate === raw);
+  const value = normalizeModeValue(env[variable]);
+  if (value) {
+    const mode = MUTATION_MODES.find((candidate) => candidate === value);
     if (mode === undefined) {
       throw new Error(
         `Invalid ${variable}=${JSON.stringify(env[variable])}; expected one of: ${MUTATION_MODES.join(", ")}.`

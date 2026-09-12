@@ -10,8 +10,15 @@ import {
   type ElicitResult,
 } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
-import { RegisterTool } from "../../../src/helpers/register-tool";
 import type { ToolDefinition } from "../../../src/types/tool-definition";
+import { mockQuickbooksClient, mockQuickbooksClientClass } from "../../mocks/quickbooks.mock";
+
+jest.unstable_mockModule("../../../src/clients/quickbooks-client", () => ({
+  quickbooksClient: mockQuickbooksClient,
+  QuickbooksClient: mockQuickbooksClientClass,
+}));
+
+const { RegisterTool } = await import("../../../src/helpers/register-tool");
 
 type InnerFn = (args: unknown, extra: unknown) => Promise<CallToolResult>;
 
@@ -33,6 +40,7 @@ describe("approval over a real MCP client/server connection", () => {
   beforeEach(() => {
     process.env.QUICKBOOKS_UPDATE_MODE = "approval";
     process.env.QUICKBOOKS_DELETE_MODE = "disabled";
+    mockQuickbooksClientClass.getRealmId.mockResolvedValue("9130");
   });
 
   afterEach(async () => {
@@ -74,6 +82,8 @@ describe("approval over a real MCP client/server connection", () => {
     expect(updateHandler.mock.calls[0][0]).toEqual(widgetArgs);
     expect(messages).toHaveLength(1);
     expect(messages[0]).toContain("UPDATE WIDGET");
+    expect(messages[0]).toContain("QuickBooks company (realm) ID: 9130");
+    expect(mockQuickbooksClientClass.getRealmId).toHaveBeenCalledTimes(2);
     expect(messages[0]).toContain('- widget.Name: "Renamed"');
   });
 
@@ -93,6 +103,7 @@ describe("approval over a real MCP client/server connection", () => {
     expect(result.isError).toBe(true);
     expect(result.content[0]).toMatchObject({ type: "text", text: expect.stringContaining("blocked (unsupported-client)") });
     expect(updateHandler).not.toHaveBeenCalled();
+    expect(mockQuickbooksClientClass.getRealmId).not.toHaveBeenCalled();
   });
 
   it("leaves read tools unaffected and hides disabled tools", async () => {

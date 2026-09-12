@@ -1,5 +1,9 @@
-import { createQuickbooksAttachable } from "../handlers/create-quickbooks-attachable.handler.js";
-import { ToolDefinition } from "../types/tool-definition.js";
+import {
+  createQuickbooksAttachable,
+  pinAttachableSource,
+} from "../handlers/create-quickbooks-attachable.handler.js";
+import { ToolResponse } from "../types/tool-response.js";
+import { PreparedApproval, ToolDefinition } from "../types/tool-definition.js";
 import { z } from "zod";
 
 const toolName = "create_attachable";
@@ -47,14 +51,28 @@ const toolSchema = z.object({
     .describe("Optional reference to a QBO entity this file is attached to."),
 });
 
-const toolHandler = async ({ params }: any) => {
-  const response = await createQuickbooksAttachable(params);
+function toToolResult(response: ToolResponse<any>) {
   if (response.isError) return { content: [{ type: "text" as const, text: `Error: ${response.error}` }] };
   return {
     content: [
       { type: "text" as const, text: `Attachable created:` },
       { type: "text" as const, text: JSON.stringify(response.result, null, 2) },
     ],
+  };
+}
+
+const toolHandler = async ({ params }: any) => toToolResult(await createQuickbooksAttachable(params));
+
+const prepareApproval = async (
+  { params }: { params: z.infer<typeof toolSchema> },
+  signal: AbortSignal
+): Promise<PreparedApproval> => {
+  const pinned = await pinAttachableSource(params, signal);
+  if (pinned === null) return { facts: {}, handler: toolHandler, dispose: async () => undefined };
+  return {
+    facts: pinned.facts,
+    handler: async ({ params: approved }: any) => toToolResult(await createQuickbooksAttachable(approved, pinned.source)),
+    dispose: pinned.dispose,
   };
 };
 
@@ -63,4 +81,5 @@ export const CreateAttachableTool: ToolDefinition<typeof toolSchema> = {
   description: toolDescription,
   schema: toolSchema,
   handler: toolHandler,
+  prepareApproval,
 };

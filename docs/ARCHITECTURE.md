@@ -102,6 +102,7 @@ src/
 │
 ├── approval/                   # Mutation mode enforcement and human approval
 │   ├── canonicalize.ts         # Deterministic argument serialization + payload hash
+│   ├── policy-env.ts           # Policy variable names and value normalization (no imports)
 │   ├── approval-config.ts      # Approval timeout and audit log settings
 │   ├── approval-store.ts       # Approval IDs, expiry, single-use/replay tracking
 │   ├── approval-audit.ts       # JSON Lines audit log, secret redaction
@@ -334,14 +335,19 @@ The approval wrapper (`approval-handler.ts`) runs, per call, after the MCP SDK h
 ```
 1. Check the connected client advertised the elicitation capability
    → missing: fail closed, no QuickBooks request
-2. Canonicalize args (canonicalize.ts) → SHA-256 hash over
-   tool name + category + realm ID + args → issue single-use approval ID
-   with expiry (approval-store.ts)
-3. Send elicitation/create form (approval-summary.ts) with the operation
-   type, tool name, realm ID, identifiers, amounts, full payload, approval
-   ID, hash, and expiry
-4. On accept with approve=true: consume the approval (single-use), then
-   invoke the original handler with exactly the approved arguments
+2. Get the realm ID from QuickbooksClient.getRealmId() (may authenticate)
+3. If the tool defines prepareApproval (create_attachable), pin external
+   inputs (file copy or URL download) → facts, pinned handler, dispose
+4. Canonicalize args (canonicalize.ts) → SHA-256 hash over
+   tool name + category + realm ID + args (+ pinned facts) → issue
+   single-use approval ID with expiry (approval-store.ts)
+5. Send elicitation/create form (approval-summary.ts) with the operation
+   type, tool name, realm ID, pinned facts, identifiers, amounts, full
+   payload, approval ID, hash, and expiry
+6. On accept with approve=true: re-check the realm ID (changed → blocked),
+   consume the approval (single-use), then invoke the handler (the pinned
+   handler if inputs were pinned) with exactly the approved arguments;
+   pinned inputs are disposed on every outcome
    Any other outcome (decline, cancel, timeout, expiry, replay, hash
    mismatch, client/internal error) blocks the call
 ```

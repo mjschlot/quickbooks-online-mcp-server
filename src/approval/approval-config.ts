@@ -1,15 +1,10 @@
 import path from "node:path";
+import { APPROVAL_ENV, normalizeApprovalValue } from "./policy-env.js";
 
 export interface ApprovalConfig {
   readonly timeoutMs: number;
   readonly auditLogPath: string | null;
 }
-
-export const APPROVAL_ENV = {
-  TIMEOUT: "QUICKBOOKS_APPROVAL_TIMEOUT_SECONDS",
-  AUDIT_LOG: "QUICKBOOKS_APPROVAL_AUDIT_LOG",
-  AUDIT_LOG_PATH: "QUICKBOOKS_APPROVAL_AUDIT_LOG_PATH",
-} as const;
 
 const { TIMEOUT: TIMEOUT_ENV, AUDIT_LOG: AUDIT_LOG_ENV, AUDIT_LOG_PATH: AUDIT_LOG_PATH_ENV } = APPROVAL_ENV;
 
@@ -18,12 +13,15 @@ const MAX_TIMEOUT_SECONDS = 3600;
 
 export function loadApprovalConfig(env: NodeJS.ProcessEnv): ApprovalConfig {
   return {
-    timeoutMs: parseTimeoutSeconds(env[TIMEOUT_ENV]?.trim()) * 1000,
-    auditLogPath: parseAuditLogPath(env[AUDIT_LOG_ENV]?.trim(), env[AUDIT_LOG_PATH_ENV]?.trim()),
+    timeoutMs: parseTimeoutSeconds(normalizeApprovalValue(env[TIMEOUT_ENV])) * 1000,
+    auditLogPath: parseAuditLogPath(
+      normalizeApprovalValue(env[AUDIT_LOG_ENV]),
+      normalizeApprovalValue(env[AUDIT_LOG_PATH_ENV])
+    ),
   };
 }
 
-function parseTimeoutSeconds(raw: string | undefined): number {
+function parseTimeoutSeconds(raw: string): number {
   if (!raw) return DEFAULT_TIMEOUT_SECONDS;
   const seconds = /^\d+$/.test(raw) ? Number(raw) : NaN;
   if (!(seconds >= 1 && seconds <= MAX_TIMEOUT_SECONDS)) {
@@ -34,7 +32,7 @@ function parseTimeoutSeconds(raw: string | undefined): number {
   return seconds;
 }
 
-function parseAuditLogPath(flag: string | undefined, logPath: string | undefined): string | null {
+function parseAuditLogPath(flag: string, logPath: string): string | null {
   if (!flag || flag === "false") {
     if (logPath) {
       throw new Error(

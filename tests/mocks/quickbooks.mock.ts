@@ -234,6 +234,7 @@ export const mockAuthCredentials = {
 export const mockQuickbooksClientClass = {
   getInstance: jest.fn<() => Promise<typeof mockQuickBooksInstance>>().mockResolvedValue(mockQuickBooksInstance),
   getAuthCredentials: jest.fn<() => Promise<typeof mockAuthCredentials>>().mockResolvedValue(mockAuthCredentials),
+  getRealmId: jest.fn<() => Promise<string>>().mockResolvedValue(mockAuthCredentials.realmId),
 };
 
 // Helper to create a successful callback mock
@@ -275,4 +276,6 @@ export function resetAllMocks() {
   (mockQuickbooksClientClass.getInstance as any).mockResolvedValue(mockQuickBooksInstance);
   mockQuickbooksClientClass.getAuthCredentials.mockReset();
   (mockQuickbooksClientClass.getAuthCredentials as any).mockResolvedValue(mockAuthCredentials);
+  mockQuickbooksClientClass.getRealmId.mockReset();
+  mockQuickbooksClientClass.getRealmId.mockResolvedValue(mockAuthCredentials.realmId);
 }

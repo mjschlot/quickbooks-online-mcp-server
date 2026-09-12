@@ -1,6 +1,6 @@
 import { lookup } from "dns/promises";
-import { createWriteStream } from "fs";
-import { randomBytes } from "crypto";
+import { createReadStream, createWriteStream } from "fs";
+import { createHash, randomBytes } from "crypto";
 import { Readable } from "stream";
 import { pipeline } from "stream/promises";
 import { Transform } from "stream";
@@ -246,10 +246,35 @@ export interface FetchedFileSource extends LocalFileSource {
   cleanup: () => Promise<void>;
 }
 
+// Aborts when the timeout elapses or `external` aborts. AbortSignal.any is not
+// used because it needs Node 20.3 and the MCP SDK still supports Node 18.
+function downloadSignal(timeoutMs: number, external: AbortSignal | undefined): { signal: AbortSignal; release: () => void } {
+  const timeout = AbortSignal.timeout(timeoutMs);
+  if (!external) return { signal: timeout, release: () => undefined };
+  const controller = new AbortController();
+  const onTimeout = () => controller.abort(timeout.reason);
+  const onExternal = () => controller.abort(external.reason);
+  if (external.aborted) onExternal();
+  timeout.addEventListener("abort", onTimeout, { once: true });
+  external.addEventListener("abort", onExternal, { once: true });
+  return {
+    signal: controller.signal,
+    release: () => {
+      timeout.removeEventListener("abort", onTimeout);
+      external.removeEventListener("abort", onExternal);
+    },
+  };
+}
+
 // Fetch an HTTPS URL and spool the body to a temp file, enforcing the size
 // cap while streaming (memory stays flat regardless of file size). Redirects
-// are followed manually (max 3) so every hop passes the SSRF checks.
-export async function fetchUrlToTempFile(fileUrl: string, maxBytes: number): Promise<FetchedFileSource> {
+// are followed manually (max 3) so every hop passes the SSRF checks. Aborting
+// `externalSignal` stops the download and removes any partial temp file.
+export async function fetchUrlToTempFile(
+  fileUrl: string,
+  maxBytes: number,
+  externalSignal?: AbortSignal
+): Promise<FetchedFileSource> {
   let current: URL;
   try {
     current = new URL(fileUrl);
@@ -257,7 +282,15 @@ export async function fetchUrlToTempFile(fileUrl: string, maxBytes: number): Pro
     throw new Error(`file_url is not a valid URL: ${fileUrl}`);
   }
 
-  const signal = AbortSignal.timeout(urlFetchTimeoutMs());
+  const { signal, release } = downloadSignal(urlFetchTimeoutMs(), externalSignal);
+  try {
+    return await spoolToTempFile(current, maxBytes, signal);
+  } finally {
+    release();
+  }
+}
+
+async function spoolToTempFile(current: URL, maxBytes: number, signal: AbortSignal): Promise<FetchedFileSource> {
   let response: Response | null = null;
   for (let hop = 0; hop <= 3; hop++) {
     await assertUrlAllowed(current);
@@ -295,6 +328,9 @@ export async function fetchUrlToTempFile(fileUrl: string, maxBytes: number): Pro
     os.tmpdir(),
     `qbo-attach-${process.pid}-${randomBytes(6).toString("hex")}.tmp`
   );
+  // Private, and "wx" never opens a path that already exists; opened before
+  // cleanup is armed so a colliding file is never deleted.
+  const handle = await fs.open(tempPath, "wx", 0o600);
   const cleanup = async () => {
     await fs.unlink(tempPath).catch(swallow);
   };
@@ -312,7 +348,11 @@ export async function fetchUrlToTempFile(fileUrl: string, maxBytes: number): Pro
   });
 
   try {
-    await pipeline(Readable.fromWeb(response.body as any), capEnforcer, createWriteStream(tempPath));
+    await pipeline(
+      Readable.fromWeb(response.body as any),
+      capEnforcer,
+      handle.createWriteStream()
+    );
   } catch (err) {
     await cleanup();
     throw err;
@@ -328,5 +368,69 @@ export async function fetchUrlToTempFile(fileUrl: string, maxBytes: number): Pro
     size: received,
     contentTypeHeader: response.headers.get("content-type"),
     cleanup,
+  };
+}
+
+// ── pinned content ────────────────────────────────────────────────────────
+
+export interface PinnedFile extends LocalFileSource {
+  sha256: string;
+  contentTypeHeader: string | null;
+  dispose: () => Promise<void>;
+}
+
+export async function sha256File(filePath: string): Promise<string> {
+  const hash = createHash("sha256");
+  for await (const chunk of createReadStream(filePath)) hash.update(chunk);
+  return hash.digest("hex");
+}
+
+// Copies exactly source.size bytes into a new private temp directory (0700
+// from mkdtemp, file 0600) and hashes them in the same pass, so later changes
+// to the original file cannot alter the pinned bytes.
+export async function pinLocalFile(source: LocalFileSource): Promise<PinnedFile> {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "qbo-attach-pin-"));
+  const dispose = () => fs.rm(dir, { recursive: true, force: true });
+  const pinnedPath = path.join(dir, "content");
+  const hash = createHash("sha256");
+  let bytes = 0;
+  const hasher = new Transform({
+    transform(chunk: Buffer, _enc, cb) {
+      hash.update(chunk);
+      bytes += chunk.length;
+      cb(null, chunk);
+    },
+  });
+  try {
+    await pipeline(
+      createReadStream(source.path, { end: source.size - 1 }),
+      hasher,
+      createWriteStream(pinnedPath, { flags: "wx", mode: 0o600 })
+    );
+    if (bytes !== source.size) {
+      throw new Error(`file_path changed while it was being read: read ${bytes} of ${source.size} expected bytes.`);
+    }
+  } catch (err) {
+    await dispose().catch(swallow);
+    throw err;
+  }
+  return { path: pinnedPath, size: bytes, sha256: hash.digest("hex"), contentTypeHeader: null, dispose };
+}
+
+// The fetched temp file becomes the pinned file; its cleanup is the disposer.
+export async function pinFetchedFile(source: FetchedFileSource): Promise<PinnedFile> {
+  let sha256: string;
+  try {
+    sha256 = await sha256File(source.path);
+  } catch (err) {
+    await source.cleanup();
+    throw err;
+  }
+  return {
+    path: source.path,
+    size: source.size,
+    sha256,
+    contentTypeHeader: source.contentTypeHeader,
+    dispose: source.cleanup,
   };
 }

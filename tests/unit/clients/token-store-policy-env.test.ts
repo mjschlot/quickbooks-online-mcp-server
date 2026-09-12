@@ -90,6 +90,27 @@ describe('token store vs host mutation policy variables', () => {
     expect(process.env.QUICKBOOKS_DELETE_MODE).toBe('approval');
   });
 
+  it.each([
+    ['mode case and whitespace', { QUICKBOOKS_UPDATE_MODE: 'Approval' }, 'QUICKBOOKS_UPDATE_MODE=" approval "\n'],
+    ['mode case in the token store', { QUICKBOOKS_WRITE_MODE: ' disabled ' }, 'QUICKBOOKS_WRITE_MODE=DISABLED\n'],
+    ['approval value whitespace', { QUICKBOOKS_APPROVAL_TIMEOUT_SECONDS: ' 60 ' }, 'QUICKBOOKS_APPROVAL_TIMEOUT_SECONDS="60"\n'],
+  ])('loads when host and token store differ only in %s', async (_label, hostEnv, fileContents) => {
+    const { quickbooksClient } = await importClient(hostEnv, fileContents);
+    expect(quickbooksClient).toBeDefined();
+  });
+
+  it('refuses to load when an approval value differs only in case', async () => {
+    await expect(
+      importClient({ QUICKBOOKS_APPROVAL_AUDIT_LOG: 'true' }, 'QUICKBOOKS_APPROVAL_AUDIT_LOG=TRUE\n'),
+    ).rejects.toThrow('Mutation policy variable(s) QUICKBOOKS_APPROVAL_AUDIT_LOG set in the host environment differ');
+  });
+
+  it('refuses to load when normalized mode values differ', async () => {
+    await expect(
+      importClient({ QUICKBOOKS_DELETE_MODE: ' Approval ' }, 'QUICKBOOKS_DELETE_MODE=allow\n'),
+    ).rejects.toThrow('Mutation policy variable(s) QUICKBOOKS_DELETE_MODE set in the host environment differ');
+  });
+
   it('lets the token store fill a blank host value', async () => {
     await importClient({ QUICKBOOKS_WRITE_MODE: '  ' }, 'QUICKBOOKS_WRITE_MODE=approval\n');
     expect(process.env.QUICKBOOKS_WRITE_MODE).toBe('approval');

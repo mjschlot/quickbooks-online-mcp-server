@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach, jest } from "@jest/globals";
+import { describe, it, expect, jest } from "@jest/globals";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -15,14 +15,24 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import type { RequestOptions } from "@modelcontextprotocol/sdk/shared/protocol.js";
 import { z } from "zod";
-import { createApprovalHandler } from "../../../src/approval/approval-handler";
 import type { ApprovalConfig } from "../../../src/approval/approval-config";
 import { ApprovalStore } from "../../../src/approval/approval-store";
-import type { ToolDefinition } from "../../../src/types/tool-definition";
+import { canonicalJson, sha256Hex } from "../../../src/approval/canonicalize";
+import type { PreparedApproval, ToolDefinition } from "../../../src/types/tool-definition";
+import { mockQuickbooksClient, mockQuickbooksClientClass } from "../../mocks/quickbooks.mock";
+
+jest.unstable_mockModule("../../../src/clients/quickbooks-client", () => ({
+  quickbooksClient: mockQuickbooksClient,
+  QuickbooksClient: mockQuickbooksClientClass,
+}));
+
+const { createApprovalHandler } = await import("../../../src/approval/approval-handler");
 
 type Extra = RequestHandlerExtra<ServerRequest, ServerNotification>;
 type ElicitFn = (params: ElicitRequestFormParams, options?: RequestOptions) => Promise<ElicitResult>;
 type InnerFn = (args: unknown, extra: unknown) => Promise<CallToolResult>;
+type RealmFn = () => Promise<string>;
+type PrepareFn = (args: { params: unknown }, signal: AbortSignal) => Promise<PreparedApproval>;
 
 const FORM_CAPABILITIES = { elicitation: { form: {} } };
 const ACCEPT: ElicitResult = { action: "accept", content: { approve: true } };
@@ -56,6 +66,8 @@ interface SetupOptions {
   inner?: InnerFn;
   toolName?: string;
   omitDeps?: boolean;
+  realmId?: RealmFn;
+  prepare?: PrepareFn;
 }
 
 function setup(options: SetupOptions = {}) {
@@ -67,21 +79,23 @@ function setup(options: SetupOptions = {}) {
   const elicitInput = jest.fn<ElicitFn>().mockResolvedValue(ACCEPT);
   const server = { server: { getClientCapabilities, elicitInput } } as unknown as McpServer;
   const inner = jest.fn<InnerFn>(options.inner ?? (async () => SUCCESS));
+  const realmId = jest.fn<RealmFn>(options.realmId ?? (async () => "9130"));
   const definition: ToolDefinition<z.ZodType<any, any>> = {
     name: options.toolName ?? "update_invoice",
     description: "Update an invoice",
     schema: z.object({ invoice: z.any() }),
     handler: inner,
+    ...(options.prepare ? { prepareApproval: options.prepare } : {}),
   };
   const config: ApprovalConfig = { timeoutMs: options.timeoutMs ?? 300_000, auditLogPath };
   const store = options.store ?? new ApprovalStore();
   const handler = options.omitDeps
     ? createApprovalHandler(server, definition, "UPDATE", config)
-    : createApprovalHandler(server, definition, "UPDATE", config, { store, now: options.now });
+    : createApprovalHandler(server, definition, "UPDATE", config, { store, now: options.now, realmId });
   const controller = new AbortController();
   const extra = { signal: controller.signal, requestId: 7, sendNotification: jest.fn(), sendRequest: jest.fn() } as unknown as Extra;
   const call = async (args: Record<string, unknown> = invoiceArgs()) => handler(args, extra);
-  return { call, inner, elicitInput, getClientCapabilities, controller, store, auditLogPath, dir: log.dir };
+  return { call, inner, elicitInput, getClientCapabilities, controller, store, realmId, auditLogPath, dir: log.dir };
 }
 
 function outcomes(logPath: string | null): unknown[] {
@@ -99,9 +113,9 @@ function approvalIdFrom(params: ElicitRequestFormParams): string {
   return match ? match[1] : "";
 }
 
-afterEach(() => {
-  delete process.env.QUICKBOOKS_REALM_ID;
-});
+function expectedHash(args: unknown, extra: Record<string, unknown> = {}): string {
+  return sha256Hex(canonicalJson({ toolName: "update_invoice", category: "UPDATE", realmId: "9130", arguments: args, ...extra }));
+}
 
 describe("createApprovalHandler before approval", () => {
   it("does not invoke the handler until the approval resolves", async () => {
@@ -121,7 +135,6 @@ describe("createApprovalHandler before approval", () => {
   });
 
   it("requests a boolean form approval bound to the call", async () => {
-    process.env.QUICKBOOKS_REALM_ID = " 9130 ";
     const ctx = setup({ timeoutMs: 120_000, store: new ApprovalStore(() => 1_000), now: () => 1_000 });
     await ctx.call();
 
@@ -150,7 +163,6 @@ describe("createApprovalHandler before approval", () => {
 
 describe("createApprovalHandler accepted approval", () => {
   it("executes exactly once with the approved arguments and audits the lifecycle", async () => {
-    process.env.QUICKBOOKS_REALM_ID = "9130";
     const ctx = setup();
     const args = invoiceArgs();
     const result = await ctx.call(args);
@@ -165,8 +177,9 @@ describe("createApprovalHandler accepted approval", () => {
     const approvalId = approvalIdFrom(ctx.elicitInput.mock.calls[0][0]);
     for (const event of events) {
       expect(event).toMatchObject({ approvalId, toolName: "update_invoice", category: "UPDATE", realmId: "9130" });
-      expect(event.payloadHash).toMatch(/^[0-9a-f]{64}$/);
+      expect(event.payloadHash).toBe(expectedHash(args));
     }
+    expect(ctx.elicitInput.mock.calls[0][0].message).toContain(`Payload SHA-256: ${expectedHash(args)}`);
     expect(events[2].entityId).toBe("42");
   });
 
@@ -185,10 +198,20 @@ describe("createApprovalHandler accepted approval", () => {
     }
   });
 
-  it("uses the default store and clock when no dependencies are injected", async () => {
-    const ctx = setup({ omitDeps: true, auditLogPath: null });
-    await ctx.call();
-    expect(ctx.inner).toHaveBeenCalledTimes(1);
+  it("uses the default store, clock, and QuickBooks client realm when no dependencies are injected", async () => {
+    mockQuickbooksClientClass.getRealmId.mockResolvedValue("client-realm");
+    process.env.QUICKBOOKS_REALM_ID = "env-realm";
+    try {
+      const ctx = setup({ omitDeps: true, auditLogPath: null });
+      await ctx.call();
+      expect(ctx.inner).toHaveBeenCalledTimes(1);
+      expect(mockQuickbooksClientClass.getRealmId).toHaveBeenCalledTimes(2);
+      const { message } = ctx.elicitInput.mock.calls[0][0];
+      expect(message).toContain("QuickBooks company (realm) ID: client-realm");
+      expect(message).not.toContain("env-realm");
+    } finally {
+      delete process.env.QUICKBOOKS_REALM_ID;
+    }
   });
 
   it("executes the arguments as approved even if the original object is mutated during approval", async () => {
@@ -250,10 +273,10 @@ describe("createApprovalHandler denials", () => {
     expect(blockedText(result)).toBe(
       "QuickBooks mutation blocked (unsupported-client): the connected MCP client does not support elicitation, so approval-mode mutations cannot run. No request was sent to QuickBooks. Approval ID: n/a."
     );
+    expect(ctx.realmId).not.toHaveBeenCalled();
     const events = readAudit(ctx.auditLogPath as string);
     expect(events).toHaveLength(1);
-    expect(events[0]).toMatchObject({ outcome: "unsupported-client", approvalId: null });
-    expect(events[0].payloadHash).toMatch(/^[0-9a-f]{64}$/);
+    expect(events[0]).toMatchObject({ outcome: "unsupported-client", approvalId: null, payloadHash: null, realmId: null });
   });
 
   it("blocks with expired when the approval request times out", async () => {
@@ -447,5 +470,219 @@ describe("createApprovalHandler execution outcomes", () => {
     expect(result).toBe(SUCCESS);
     expect(ctx.inner).toHaveBeenCalledTimes(1);
     expect(errorSpy).toHaveBeenCalledWith(expect.stringMatching(/^QuickBooks approval audit write failed \(executed, approval [0-9a-f-]{36}\): /));
+  });
+});
+
+describe("createApprovalHandler realm binding", () => {
+  it("blocks without prompting when the realm cannot be determined", async () => {
+    const ctx = setup({ realmId: async () => { throw new Error("QuickBooks not authenticated: Bearer abc.def.ghi"); } });
+    const result = await ctx.call();
+    expect(ctx.inner).not.toHaveBeenCalled();
+    expect(ctx.elicitInput).not.toHaveBeenCalled();
+    expect(blockedText(result)).toContain("(approval-error): the QuickBooks company (realm) ID could not be determined");
+    const events = readAudit(ctx.auditLogPath as string);
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ outcome: "approval-error", realmId: null, payloadHash: null });
+    expect(events[0].error).toContain("[REDACTED]");
+    expect(JSON.stringify(events)).not.toContain("abc.def.ghi");
+  });
+
+  it("blocks when the realm changes between approval and execution", async () => {
+    const store = new ApprovalStore();
+    const consume = jest.spyOn(store, "consume");
+    const ctx = setup({ store });
+    ctx.realmId.mockResolvedValueOnce("9130").mockResolvedValueOnce("5555");
+    const result = await ctx.call();
+    expect(ctx.inner).not.toHaveBeenCalled();
+    expect(consume).not.toHaveBeenCalled();
+    expect(blockedText(result)).toContain("(hash-mismatch): the QuickBooks company changed after approval");
+    expect(outcomes(ctx.auditLogPath)).toEqual(["requested", "hash-mismatch"]);
+    expect(readAudit(ctx.auditLogPath as string)[1]).toMatchObject({ realmId: "9130" });
+  });
+
+  it("blocks when the realm cannot be re-checked before execution", async () => {
+    const ctx = setup();
+    ctx.realmId.mockResolvedValueOnce("9130").mockRejectedValueOnce(new Error("refresh failed"));
+    const result = await ctx.call();
+    expect(ctx.inner).not.toHaveBeenCalled();
+    expect(blockedText(result)).toContain("(approval-error): the QuickBooks company (realm) ID could not be re-checked before execution");
+    expect(outcomes(ctx.auditLogPath)).toEqual(["requested", "approval-error"]);
+  });
+
+  it("re-checks the realm after the prompt and before consuming the approval", async () => {
+    const store = new ApprovalStore();
+    const consume = jest.spyOn(store, "consume");
+    const ctx = setup({ store });
+    await ctx.call();
+    expect(ctx.realmId).toHaveBeenCalledTimes(2);
+    const [, recheck] = ctx.realmId.mock.invocationCallOrder;
+    expect(ctx.elicitInput.mock.invocationCallOrder[0]).toBeLessThan(recheck);
+    expect(recheck).toBeLessThan(consume.mock.invocationCallOrder[0]);
+    expect(ctx.inner).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("createApprovalHandler pinned inputs", () => {
+  const FACTS = { source: "file_path", bytes: 3, sha256: "ab".repeat(32) };
+
+  function pinning(overrides: Partial<PreparedApproval> = {}) {
+    const pinnedHandler = jest.fn<InnerFn>(async () => SUCCESS);
+    const dispose = jest.fn<() => Promise<void>>(async () => undefined);
+    const prepare = jest.fn<PrepareFn>(async () => ({ facts: FACTS, handler: pinnedHandler, dispose, ...overrides }));
+    return { pinnedHandler, dispose, prepare };
+  }
+
+  it("binds pinned facts into the hash and summary and runs the pinned handler", async () => {
+    const pin = pinning();
+    const store = new ApprovalStore();
+    const issue = jest.spyOn(store, "issue");
+    const ctx = setup({ prepare: pin.prepare, store });
+    const args = invoiceArgs();
+    const result = await ctx.call(args);
+
+    expect(result).toBe(SUCCESS);
+    expect(pin.prepare).toHaveBeenCalledTimes(1);
+    expect(pin.prepare.mock.calls[0][0]).toEqual(args);
+    expect(pin.prepare.mock.calls[0][0]).not.toBe(args);
+    expect(pin.prepare.mock.calls[0][1]).toBe(ctx.controller.signal);
+    expect(pin.pinnedHandler).toHaveBeenCalledTimes(1);
+    expect(pin.pinnedHandler.mock.calls[0][0]).toEqual(args);
+    expect(ctx.inner).not.toHaveBeenCalled();
+
+    const hash = expectedHash(args, { pinned: FACTS });
+    expect(readAudit(ctx.auditLogPath as string).map((event) => event.payloadHash)).toEqual([hash, hash, hash]);
+    const { message } = ctx.elicitInput.mock.calls[0][0];
+    expect(message).toContain(`Payload SHA-256: ${hash}`);
+    expect(message).toContain(`Pinned file content:\n- source: "file_path"\n- bytes: 3\n- sha256: "${FACTS.sha256}"`);
+
+    expect(ctx.realmId.mock.invocationCallOrder[0]).toBeLessThan(pin.prepare.mock.invocationCallOrder[0]);
+    expect(pin.prepare.mock.invocationCallOrder[0]).toBeLessThan(issue.mock.invocationCallOrder[0]);
+    expect(pin.dispose).toHaveBeenCalledTimes(1);
+    expect(pin.pinnedHandler.mock.invocationCallOrder[0]).toBeLessThan(pin.dispose.mock.invocationCallOrder[0]);
+  });
+
+  it("includes an empty pinned object in the hash when the hook pins nothing", async () => {
+    const pin = pinning({ facts: {} });
+    const ctx = setup({ prepare: pin.prepare });
+    const args = invoiceArgs();
+    await ctx.call(args);
+    expect(readAudit(ctx.auditLogPath as string)[0].payloadHash).toBe(expectedHash(args, { pinned: {} }));
+  });
+
+  it("issues the approval after pinning so pinning time does not shorten the approval window", async () => {
+    const clock = { now: 0 };
+    const pin = pinning();
+    pin.prepare.mockImplementationOnce(async () => {
+      clock.now = 10_000;
+      return { facts: FACTS, handler: pin.pinnedHandler, dispose: pin.dispose };
+    });
+    const ctx = setup({ prepare: pin.prepare, timeoutMs: 1_000, store: new ApprovalStore(() => clock.now), now: () => clock.now });
+    await ctx.call();
+    expect(ctx.elicitInput.mock.calls[0][1]).toMatchObject({ timeout: 1_000 });
+    expect(pin.pinnedHandler).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ["the user declines", (ctx: ReturnType<typeof setup>) => ctx.elicitInput.mockResolvedValueOnce({ action: "decline" }), "declined"],
+    ["elicitation fails", (ctx: ReturnType<typeof setup>) => ctx.elicitInput.mockRejectedValueOnce(new Error("boom")), "approval-error"],
+    ["the realm changes", (ctx: ReturnType<typeof setup>) => ctx.realmId.mockResolvedValueOnce("9130").mockResolvedValueOnce("1"), "hash-mismatch"],
+  ] as const)("disposes pinned inputs when %s", async (_label, arrange, outcome) => {
+    const pin = pinning();
+    const ctx = setup({ prepare: pin.prepare });
+    arrange(ctx);
+    const result = await ctx.call();
+    expect(blockedText(result)).toContain(`(${outcome})`);
+    expect(pin.pinnedHandler).not.toHaveBeenCalled();
+    expect(ctx.inner).not.toHaveBeenCalled();
+    expect(pin.dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it("disposes pinned inputs when the pinned handler throws", async () => {
+    const failure = new Error("upload failed");
+    const pin = pinning();
+    pin.pinnedHandler.mockRejectedValueOnce(failure);
+    const ctx = setup({ prepare: pin.prepare });
+    await expect(ctx.call()).rejects.toBe(failure);
+    expect(pin.dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not pin for an unsupported client", async () => {
+    const pin = pinning();
+    const ctx = setup({ prepare: pin.prepare, capabilities: {} });
+    await ctx.call();
+    expect(pin.prepare).not.toHaveBeenCalled();
+    expect(pin.dispose).not.toHaveBeenCalled();
+  });
+
+  it("blocks without prompting when pinning fails", async () => {
+    const pin = pinning();
+    pin.prepare.mockRejectedValueOnce(new Error("file_path denied: dotfiles and dot-directories are not attachable"));
+    const ctx = setup({ prepare: pin.prepare });
+    const result = await ctx.call();
+    expect(ctx.inner).not.toHaveBeenCalled();
+    expect(pin.pinnedHandler).not.toHaveBeenCalled();
+    expect(ctx.elicitInput).not.toHaveBeenCalled();
+    expect(blockedText(result)).toContain(
+      "(approval-error): the tool's external input could not be pinned for approval (file_path denied: dotfiles and dot-directories are not attachable)"
+    );
+    expect(readAudit(ctx.auditLogPath as string)).toEqual([
+      expect.objectContaining({ outcome: "approval-error", approvalId: null, payloadHash: null, error: expect.stringContaining("file_path denied") }),
+    ]);
+  });
+
+  it("denies as canceled when the call is canceled while pinning fails", async () => {
+    const pin = pinning();
+    const ctx = setup({ prepare: pin.prepare });
+    pin.prepare.mockImplementationOnce(async () => {
+      ctx.controller.abort();
+      throw new Error("This operation was aborted");
+    });
+    const result = await ctx.call();
+    expect(blockedText(result)).toContain("(canceled): the tool call was canceled while its external input was being pinned");
+    expect(ctx.elicitInput).not.toHaveBeenCalled();
+    expect(pin.pinnedHandler).not.toHaveBeenCalled();
+    expect(ctx.inner).not.toHaveBeenCalled();
+    expect(outcomes(ctx.auditLogPath)).toEqual(["canceled"]);
+  });
+
+  it("denies as canceled and disposes when the call is canceled after pinning succeeds", async () => {
+    const pin = pinning();
+    const ctx = setup({ prepare: pin.prepare });
+    pin.prepare.mockImplementationOnce(async () => {
+      ctx.controller.abort();
+      return { facts: FACTS, handler: pin.pinnedHandler, dispose: pin.dispose };
+    });
+    const result = await ctx.call();
+    expect(blockedText(result)).toContain("(canceled): the tool call was canceled while its external input was being pinned");
+    expect(ctx.elicitInput).not.toHaveBeenCalled();
+    expect(pin.pinnedHandler).not.toHaveBeenCalled();
+    expect(pin.dispose).toHaveBeenCalledTimes(1);
+    expect(outcomes(ctx.auditLogPath)).toEqual(["canceled"]);
+  });
+
+  it("reports a dispose failure on stderr without changing a successful result", async () => {
+    const errorSpy = jest.spyOn(console, "error").mockImplementation(() => undefined);
+    const pin = pinning();
+    pin.dispose.mockRejectedValueOnce(new Error("EBUSY Authorization: Bearer abc.def.ghi"));
+    const ctx = setup({ prepare: pin.prepare });
+    const result = await ctx.call();
+    expect(result).toBe(SUCCESS);
+    expect(pin.pinnedHandler).toHaveBeenCalledTimes(1);
+    expect(errorSpy).toHaveBeenCalledTimes(1);
+    expect(errorSpy.mock.calls[0][0]).toMatch(/^QuickBooks approval pinned input cleanup failed \(approval [0-9a-f-]{36}\): /);
+    expect(errorSpy.mock.calls[0][0]).toContain("[REDACTED]");
+    expect(errorSpy.mock.calls[0][0]).not.toContain("abc.def.ghi");
+  });
+
+  it("reports a dispose failure on stderr without executing a denied call", async () => {
+    const errorSpy = jest.spyOn(console, "error").mockImplementation(() => undefined);
+    const pin = pinning({ facts: { bytes: Number.NaN } });
+    pin.dispose.mockRejectedValueOnce(new Error("EBUSY"));
+    const ctx = setup({ prepare: pin.prepare });
+    const result = await ctx.call();
+    expect(blockedText(result)).toContain("(approval-error): the pinned input facts could not be canonicalized");
+    expect(ctx.elicitInput).not.toHaveBeenCalled();
+    expect(pin.pinnedHandler).not.toHaveBeenCalled();
+    expect(errorSpy).toHaveBeenCalledWith("QuickBooks approval pinned input cleanup failed (approval n/a): EBUSY");
   });
 });

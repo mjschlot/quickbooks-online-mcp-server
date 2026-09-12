@@ -7,8 +7,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import open from 'open';
-import { APPROVAL_ENV } from '../approval/approval-config.js';
-import { MODE_ENV } from '../helpers/register-tool.js';
+import { POLICY_ENV_NORMALIZERS } from '../approval/policy-env.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -43,14 +42,15 @@ const TOKEN_STORE_PATH =
 //
 // Mutation-policy variables are the exception: an operator who sets one in the
 // host env must not have it silently replaced by a writable token store, so a
-// conflicting value there refuses startup instead of winning.
-const POLICY_ENV_KEYS = [...Object.values(MODE_ENV), ...Object.values(APPROVAL_ENV)];
-const hostPolicyEnv = new Map(POLICY_ENV_KEYS.map((key) => [key, process.env[key]]));
+// conflicting value there refuses startup instead of winning. Values are
+// compared after normalization, so spellings the server interprets identically
+// (e.g. "Approval" and "approval") do not conflict.
+const hostPolicyEnv = new Map(POLICY_ENV_NORMALIZERS.map(([key, normalize]) => [key, normalize(process.env[key])]));
 dotenv.config({ path: TOKEN_STORE_PATH, override: true });
-const conflictingPolicyKeys = POLICY_ENV_KEYS.filter((key) => {
+const conflictingPolicyKeys = POLICY_ENV_NORMALIZERS.filter(([key, normalize]) => {
   const hostValue = hostPolicyEnv.get(key);
-  return Boolean(hostValue?.trim()) && process.env[key] !== hostValue;
-});
+  return Boolean(hostValue) && normalize(process.env[key]) !== hostValue;
+}).map(([key]) => key);
 if (conflictingPolicyKeys.length > 0) {
   throw Error(
     `Mutation policy variable(s) ${conflictingPolicyKeys.join(', ')} set in the host environment differ from the token store file ${TOKEN_STORE_PATH}; set each in only one location.`
@@ -710,6 +710,15 @@ export class QuickbooksClient {
       realmId: quickbooksClient.realmId,
       isSandbox: quickbooksClient.environment === 'sandbox',
     };
+  }
+
+  // The company every handler call will target, with the same authentication
+  // and freshness handling as getAuthCredentials(). Returns no token material,
+  // so the approval layer can bind approvals to the realm without seeing
+  // credentials. Authentication can change the realm (interactive OAuth flow).
+  static async getRealmId(): Promise<string> {
+    const { realmId } = await QuickbooksClient.getAuthCredentials();
+    return realmId;
   }
 
   getQuickbooks() {

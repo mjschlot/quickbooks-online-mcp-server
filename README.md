@@ -170,11 +170,13 @@ QUICKBOOKS_DELETE_MODE=disabled
 For a tool in `approval` mode, after the MCP SDK validates the call's arguments against the tool's schema, the server:
 
 1. Checks that the connected client advertised the MCP `elicitation` (form) capability. If not, the call fails closed with an error, and no request is sent to QuickBooks.
-2. Canonicalizes the exact arguments and computes a SHA-256 hash over the tool name, mutation category, realm ID, and arguments, then issues a single-use approval ID that expires after `QUICKBOOKS_APPROVAL_TIMEOUT_SECONDS`.
-3. Sends an `elicitation/create` form request showing the operation type (CREATE/UPDATE/DELETE, with a conspicuous warning for DELETE), the tool name, realm ID, identifiers, amount-like fields, every field of the exact payload, the approval ID, the payload hash, and the expiry. The user must set `approve` to true and accept the form.
-4. On approval, consumes the single-use approval and runs the existing handler with exactly the approved arguments.
+2. Gets the realm ID from the QuickBooks client — the company the mutation will actually target. This may authenticate first (a token refresh, or in sandbox the interactive OAuth flow) before the prompt appears.
+3. For `create_attachable`, pins the file content (see below).
+4. Canonicalizes the exact arguments and computes a SHA-256 hash over the tool name, mutation category, realm ID, arguments, and any pinned file facts, then issues a single-use approval ID that expires after `QUICKBOOKS_APPROVAL_TIMEOUT_SECONDS`.
+5. Sends an `elicitation/create` form request showing the operation type (CREATE/UPDATE/DELETE, with a conspicuous warning for DELETE), the tool name, realm ID, pinned file content, identifiers, amount-like fields, every field of the exact payload, the approval ID, the payload hash, and the expiry. The user must set `approve` to true and accept the form.
+6. On approval, re-checks the client's realm ID (blocking the call if the company changed), consumes the single-use approval, and runs the handler with exactly the approved arguments.
 
-Decline, cancel, accepting without `approve=true`, timeout, a cancelled tool call, client/elicitation errors, an expired, replayed, or mismatched approval, and internal errors all block the call — none of them send a request to QuickBooks. Each approval covers exactly one call; retrying or changing arguments requires a new approval. Approval state is kept in memory only: it does not survive a server restart, and approvals are never persisted or reused across restarts.
+Decline, cancel, accepting without `approve=true`, timeout, a cancelled tool call, client/elicitation errors, an expired, replayed, or mismatched approval, a QuickBooks company change after approval, a file that cannot be pinned, and internal errors all block the call — none of them send a request to QuickBooks. Each approval covers exactly one call; retrying or changing arguments requires a new approval. Approval state is kept in memory only: it does not survive a server restart, and approvals are never persisted or reused across restarts.
 
 `QUICKBOOKS_APPROVAL_TIMEOUT_SECONDS` (integer, 1–3600, default `300`) sets how long the user has to respond before the approval expires. An invalid value makes the server refuse to start.
 
@@ -220,7 +222,9 @@ Caveats:
 - Some clients apply their own tool-call timeout, which may be shorter than `QUICKBOOKS_APPROVAL_TIMEOUT_SECONDS`.
 - The server cannot verify that a human, rather than an automated hook or client policy, answered the prompt — the client is responsible for showing it to a person.
 
-Approval covers the arguments sent to the tool, not data read when the mutation runs: file content for `file_path`/`file_url` is read at execution time, so the approval covers the file reference rather than the file bytes, and update handlers may merge the approved patch with the current QuickBooks record fetched at execution time (for example, its `SyncToken`), so the approval does not cover the full stored record.
+For `create_attachable`, the server reads the `file_path` content or downloads the `file_url` before asking for approval, shows the content's size and SHA-256 in the prompt, and uploads exactly those pinned bytes. A `file_url` download therefore happens before approval, so a declined, denied, or cancelled call may already have downloaded the content (cancelling the tool call aborts a download in progress); no QuickBooks request is sent before approval. The pinned copy is deleted when the call finishes.
+
+Approval covers the arguments sent to the tool, not other data read when the mutation runs: update handlers may merge the approved patch with the current QuickBooks record fetched at execution time (for example, its `SyncToken`), so the approval does not cover the full stored record.
 
 Approval mode is a server-enforced safeguard. It is not a substitute for QuickBooks user permissions, OAuth credential security, backups, review processes, or accounting controls. The LLM is not the security boundary; approval is enforced in server code.
 

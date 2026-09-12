@@ -11,11 +11,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `QUICKBOOKS_WRITE_MODE`, `QUICKBOOKS_UPDATE_MODE`, and `QUICKBOOKS_DELETE_MODE`, each `allow` | `approval` | `disabled`, controlling registration and approval requirements for `create_*`, `update_*`, and `delete_*` tools respectively. Legacy `QUICKBOOKS_DISABLE_*` flags remain supported.
 - Server-enforced human approval for mutations in `approval` mode, using MCP elicitation: the server checks client support, canonicalizes and hashes the exact call, and requires a single-use, time-limited approval before sending any request to QuickBooks.
+- Approvals bind the realm ID the QuickBooks client will use, re-checked before execution, and for `create_attachable` the SHA-256 of the file content, which is read or downloaded before the prompt and uploaded exactly as approved.
 - Optional JSON Lines audit log for approval-mode calls (`QUICKBOOKS_APPROVAL_AUDIT_LOG`, `QUICKBOOKS_APPROVAL_AUDIT_LOG_PATH`), recording outcomes without arguments, payload values, or credentials.
+- In `approval` mode, `create_attachable` downloads `file_url` content (a GET to that URL, no QuickBooks request) before the prompt; cancelling the tool call aborts the download.
+- Audit records for `unsupported-client` outcomes and argument canonicalization failures have `payloadHash` and `realmId` set to `null`.
 
 ### Changed
 
 - A tool name that does not match a known verb prefix (`create_`/`update_`/`delete_`/`get_`/`search_`/`read_`, or their hyphen variants) now causes a startup error instead of being silently treated as a read tool.
+- `file_url` downloads are written to a new temp file with mode `0600` that never replaces an existing path.
 
 ## [0.0.1] - 2024-01-13
 

@@ -4,7 +4,9 @@ export interface ApprovalMessageInput {
   toolName: string;
   category: MutationCategory;
   args: unknown;
-  realmId: string | null;
+  realmId: string;
+  /** Facts about pinned external inputs; omitted when the tool pins nothing. */
+  pinned?: Record<string, string | number>;
   approvalId: string;
   payloadHash: string;
   expiresAt: number;
@@ -43,8 +45,11 @@ export function buildApprovalMessage(input: ApprovalMessageInput): string {
     lines.push(`${VERB[input.category]} ${entity}`);
   }
   lines.push(`Tool: ${input.toolName}`);
-  lines.push(`QuickBooks company (realm) ID: ${input.realmId ?? "not configured"}`);
-  if (hasFileReference(input.args)) {
+  lines.push(`QuickBooks company (realm) ID: ${escapeUnsafe(input.realmId)}`);
+  const pinnedLeaves = Object.entries(input.pinned ?? {}).map(([key, value]) => ({ path: key, keys: [key], value }));
+  if (pinnedLeaves.length > 0) {
+    appendSection(lines, "Pinned file content:", pinnedLeaves);
+  } else if (hasFileReference(input.args)) {
     lines.push("");
     lines.push(
       "NOTE — File content is read from file_path/file_url when the mutation runs; this approval covers the reference, not the file bytes."
@@ -95,8 +100,8 @@ function keySegment(key: string, topLevel: boolean): string {
   return topLevel ? key : `.${key}`;
 }
 
-// The file-reading handler runs after approval, so the hash binds the reference
-// string rather than the bytes it points to.
+// Without pinned facts, a file-reading handler reads after approval, so the
+// hash binds the reference string rather than the bytes it points to.
 function hasFileReference(args: unknown): boolean {
   if (typeof args !== "object" || args === null) return false;
   const params: unknown = (args as { params?: unknown }).params;

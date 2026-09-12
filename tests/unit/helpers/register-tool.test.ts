@@ -1,12 +1,16 @@
 import { describe, it, expect, afterEach, jest } from "@jest/globals";
-import {
-  getCrudCategory,
-  resolveMutationMode,
-  RegisterTool,
-} from "../../../src/helpers/register-tool";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { ToolDefinition } from "../../../src/types/tool-definition";
+import { mockQuickbooksClient, mockQuickbooksClientClass } from "../../mocks/quickbooks.mock";
+
+// register-tool loads the approval wrapper, which imports the QuickBooks client.
+jest.unstable_mockModule("../../../src/clients/quickbooks-client", () => ({
+  quickbooksClient: mockQuickbooksClient,
+  QuickbooksClient: mockQuickbooksClientClass,
+}));
+
+const { getCrudCategory, resolveMutationMode, RegisterTool } = await import("../../../src/helpers/register-tool");
 
 const POLICY_ENV = [
   "QUICKBOOKS_DISABLE_WRITE",

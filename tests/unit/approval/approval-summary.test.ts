@@ -44,8 +44,9 @@ describe("buildApprovalMessage", () => {
     expect(lines[1]).toBe("This deletes or voids a QuickBooks record and may not be reversible.");
   });
 
-  it("shows when the realm is not configured", () => {
-    expect(buildApprovalMessage({ ...base, realmId: null })).toContain("QuickBooks company (realm) ID: not configured");
+  it("escapes unsafe characters in the realm ID", () => {
+    const lines = buildApprovalMessage({ ...base, realmId: "91\n30" }).split("\n");
+    expect(lines[2]).toBe("QuickBooks company (realm) ID: 91\\u000a30");
   });
 
   it("lists identifiers, amounts, and the exact flattened payload", () => {
@@ -165,6 +166,35 @@ describe("buildApprovalMessage", () => {
       "",
       "NOTE — File content is read from file_path/file_url when the mutation runs; this approval covers the reference, not the file bytes.",
     ]);
+  });
+
+  it("shows pinned facts in place of the file note", () => {
+    const message = buildApprovalMessage({
+      ...base,
+      toolName: "create_attachable",
+      category: "WRITE",
+      args: { params: { file_name: "receipt.pdf", file_path: "/home/me/receipt.pdf" } },
+      pinned: { source: "file_path", bytes: 1024, sha256: "a".repeat(64), content_type_header: "text/plain\u202e" },
+    });
+    expect(message).not.toContain("NOTE —");
+    expect(message.split("\n").slice(3, 9)).toEqual([
+      "",
+      "Pinned file content:",
+      '- source: "file_path"',
+      "- bytes: 1024",
+      `- sha256: "${"a".repeat(64)}"`,
+      '- content_type_header: "text/plain\\u202e"',
+    ]);
+  });
+
+  it("keeps the file note when no facts were pinned", () => {
+    const message = buildApprovalMessage({
+      ...base,
+      args: { params: { file_name: "receipt.pdf", file_path: "/a.pdf", file_url: "https://example.com/a.pdf" } },
+      pinned: {},
+    });
+    expect(message).toContain("NOTE —");
+    expect(message).not.toContain("Pinned file content:");
   });
 
   it.each([

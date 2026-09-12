@@ -1,7 +1,15 @@
-import { describe, it, expect } from "@jest/globals";
+import { describe, it, expect, jest } from "@jest/globals";
 import fs from "node:fs";
 import path from "node:path";
-import { getCrudCategory } from "../../../src/helpers/register-tool";
+import { mockQuickbooksClient, mockQuickbooksClientClass } from "../../mocks/quickbooks.mock";
+
+// register-tool loads the approval wrapper, which imports the QuickBooks client.
+jest.unstable_mockModule("../../../src/clients/quickbooks-client", () => ({
+  quickbooksClient: mockQuickbooksClient,
+  QuickbooksClient: mockQuickbooksClientClass,
+}));
+
+const { getCrudCategory } = await import("../../../src/helpers/register-tool");
 
 // Tool files are read as text rather than imported: importing them would pull
 // every handler into the coverage report without exercising it. The patterns
