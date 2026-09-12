@@ -5,6 +5,18 @@ All notable changes to the QuickBooks Online MCP Server are documented in this f
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `QUICKBOOKS_WRITE_MODE`, `QUICKBOOKS_UPDATE_MODE`, and `QUICKBOOKS_DELETE_MODE`, each `allow` | `approval` | `disabled`, controlling registration and approval requirements for `create_*`, `update_*`, and `delete_*` tools respectively. Legacy `QUICKBOOKS_DISABLE_*` flags remain supported.
+- Server-enforced human approval for mutations in `approval` mode, using MCP elicitation: the server checks client support, canonicalizes and hashes the exact call, and requires a single-use, time-limited approval before sending any request to QuickBooks.
+- Optional JSON Lines audit log for approval-mode calls (`QUICKBOOKS_APPROVAL_AUDIT_LOG`, `QUICKBOOKS_APPROVAL_AUDIT_LOG_PATH`), recording outcomes without arguments, payload values, or credentials.
+
+### Changed
+
+- A tool name that does not match a known verb prefix (`create_`/`update_`/`delete_`/`get_`/`search_`/`read_`, or their hyphen variants) now causes a startup error instead of being silently treated as a read tool.
+
 ## [0.0.1] - 2024-01-13
 
 ### Summary
