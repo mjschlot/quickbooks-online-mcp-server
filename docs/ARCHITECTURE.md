@@ -337,7 +337,7 @@ The approval wrapper (`approval-handler.ts`) runs, per call, after the MCP SDK h
    → missing: fail closed, no QuickBooks request
 2. Get the realm ID from QuickbooksClient.getRealmId() (may authenticate)
 3. If the tool defines prepareApproval (create_attachable), pin external
-   inputs (file copy or URL download) → facts, pinned handler, dispose
+   inputs (file read or URL download, held in memory) → facts, pinned handler
 4. Canonicalize args (canonicalize.ts) → SHA-256 hash over
    tool name + category + realm ID + args (+ pinned facts) → issue
    single-use approval ID with expiry (approval-store.ts)
@@ -346,8 +346,7 @@ The approval wrapper (`approval-handler.ts`) runs, per call, after the MCP SDK h
    payload, approval ID, hash, and expiry
 6. On accept with approve=true: re-check the realm ID (changed → blocked),
    consume the approval (single-use), then invoke the handler (the pinned
-   handler if inputs were pinned) with exactly the approved arguments;
-   pinned inputs are disposed on every outcome
+   handler if inputs were pinned) with exactly the approved arguments
    Any other outcome (decline, cancel, timeout, expiry, replay, hash
    mismatch, client/internal error) blocks the call
 ```
@@ -564,7 +563,7 @@ User sees result
 5. **Input Validation**: Zod schemas validate all inputs
 6. **Mutation Approval**: `create_*`/`update_*`/`delete_*` tools can be set to `approval` mode, requiring server-enforced, single-use, time-limited human approval of the exact call via MCP elicitation before any request reaches QuickBooks; unsupported clients fail closed. See `src/approval/` and the README's [Mutation Modes and Approval](../README.md#mutation-modes-and-approval).
 7. **Fail-Closed Classification**: A tool name that does not match a known read/create/update/delete prefix causes a startup error rather than being silently registered as unrestricted.
-8. **Audit Logging**: Approval-mode calls can be logged to a JSON Lines file recording outcomes and a payload hash, never argument values or credentials.
+8. **Audit Logging**: Approval-mode calls can be logged to a JSON Lines file recording outcomes and a payload hash rather than arguments; error text is sanitized to redact credentials and known argument values.
 
 ---
 

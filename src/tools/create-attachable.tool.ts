@@ -68,11 +68,10 @@ const prepareApproval = async (
   signal: AbortSignal
 ): Promise<PreparedApproval> => {
   const pinned = await pinAttachableSource(params, signal);
-  if (pinned === null) return { facts: {}, handler: toolHandler, dispose: async () => undefined };
+  if (pinned === null) return { facts: {}, handler: toolHandler };
   return {
     facts: pinned.facts,
     handler: async ({ params: approved }: any) => toToolResult(await createQuickbooksAttachable(approved, pinned.source)),
-    dispose: pinned.dispose,
   };
 };
 

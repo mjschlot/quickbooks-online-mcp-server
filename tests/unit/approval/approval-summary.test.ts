@@ -1,4 +1,5 @@
 import { describe, it, expect } from "@jest/globals";
+import { createHash } from "node:crypto";
 import { buildApprovalMessage, type ApprovalMessageInput } from "../../../src/approval/approval-summary";
 
 const base: ApprovalMessageInput = {
@@ -205,6 +206,39 @@ describe("buildApprovalMessage", () => {
     ["null arguments", null],
   ])("omits the file note for %s", (_label, args) => {
     expect(buildApprovalMessage({ ...base, args })).not.toContain("NOTE —");
+  });
+
+  it("shows strings of up to 4,096 characters in full", () => {
+    const note = "n".repeat(4_096);
+    const message = buildApprovalMessage({ ...base, args: { params: { note } } });
+    expect(sectionLines(message, "Exact payload:")).toEqual([`- note: "${note}"`]);
+  });
+
+  it("summarizes longer strings by character count and UTF-8 SHA-256 in every section", () => {
+    const amount = "é".repeat(4_097);
+    const hash = createHash("sha256").update(Buffer.from(amount, "utf8")).digest("hex");
+    const summary = `<string: 4097 characters, SHA-256 ${hash}>`;
+    const message = buildApprovalMessage({ ...base, args: { params: { Amount: amount, customer_id: amount } } });
+    expect(sectionLines(message, "Identifiers:")).toEqual([`- customer_id: ${summary}`]);
+    expect(sectionLines(message, "Amounts:")).toEqual([`- Amount: ${summary}`]);
+    expect(sectionLines(message, "Exact payload:")).toEqual([`- Amount: ${summary}`, `- customer_id: ${summary}`]);
+    expect(message).not.toContain("éé");
+  });
+
+  it("summarizes large base64_content", () => {
+    const content = Buffer.alloc(150_000, 7).toString("base64");
+    const hash = createHash("sha256").update(content, "utf8").digest("hex");
+    const message = buildApprovalMessage({
+      ...base,
+      toolName: "create_attachable",
+      category: "WRITE",
+      args: { params: { file_name: "a.pdf", base64_content: content } },
+    });
+    expect(sectionLines(message, "Exact payload:")).toEqual([
+      '- file_name: "a.pdf"',
+      `- base64_content: <string: ${content.length} characters, SHA-256 ${hash}>`,
+    ]);
+    expect(message.length).toBeLessThan(2_000);
   });
 
   it("renders non-object arguments and undefined values without throwing", () => {

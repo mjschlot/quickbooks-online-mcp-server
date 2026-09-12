@@ -52,7 +52,7 @@ function mockStreamingUploadResponse(statusCode: number, responseBody: unknown) 
   return captured;
 }
 
-const { pinFetchedFile, pinLocalFile } = await import('../../../src/helpers/attachable-file-source');
+const { readFileSnapshot } = await import('../../../src/helpers/attachable-file-source');
 const { createQuickbooksAttachable, pinAttachableSource } = await import(
   '../../../src/handlers/create-quickbooks-attachable.handler'
 );
@@ -75,12 +75,16 @@ function required<T>(value: T | null | undefined): T {
   return value;
 }
 
-async function exists(target: string): Promise<boolean> {
-  return fs.access(target).then(() => true, () => false);
+async function tempFiles(): Promise<string[]> {
+  return (await fs.readdir(os.tmpdir())).filter((name) => name.startsWith(`qbo-attach-${process.pid}-`));
 }
 
-async function pinDirs(): Promise<string[]> {
-  return (await fs.readdir(os.tmpdir())).filter((name) => name.startsWith('qbo-attach-pin-'));
+// The file part of the multipart body: between the blank line after its
+// headers and the closing boundary.
+function uploadedFilePart(body: Buffer, fileName: string): Buffer {
+  const headers = body.indexOf(`filename="${fileName}"`);
+  const start = body.indexOf('\r\n\r\n', headers) + 4;
+  return body.subarray(start, body.lastIndexOf('\r\n--'));
 }
 
 beforeAll(async () => {
@@ -107,119 +111,90 @@ afterEach(() => {
 });
 
 describe('pinAttachableSource with file_path', () => {
-  it('copies the bytes into a private temp file and reports their size and SHA-256', async () => {
+  it('snapshots the bytes in memory without a temp copy and reports their size and SHA-256', async () => {
     const bytes = Buffer.from('%PDF-1.7 original receipt');
     const original = path.join(baseDir, 'receipt.pdf');
     await fs.writeFile(original, bytes);
+    const before = await tempFiles();
 
     const pinned = required(await pinAttachableSource({ file_name: 'receipt.pdf', file_path: original }, callSignal));
 
     expect(pinned.facts).toEqual({ source: 'file_path', bytes: bytes.length, sha256: sha256(bytes) });
-    expect(pinned.source).toMatchObject({ size: bytes.length, sha256: sha256(bytes), contentTypeHeader: null });
-    expect(pinned.source.path.startsWith(os.tmpdir())).toBe(true);
-    expect(pinned.source.path).not.toBe(original);
-    expect(await fs.readFile(pinned.source.path)).toEqual(bytes);
-    if (process.platform !== 'win32') {
-      expect((await fs.stat(path.dirname(pinned.source.path))).mode & 0o777).toBe(0o700);
-      expect((await fs.stat(pinned.source.path)).mode & 0o777).toBe(0o600);
-    }
-
-    await pinned.dispose();
-    expect(await exists(path.dirname(pinned.source.path))).toBe(false);
-    expect(await exists(original)).toBe(true);
+    expect(pinned.source).toEqual({ buffer: bytes, contentTypeHeader: null });
+    expect(await tempFiles()).toEqual(before);
   });
 
-  it('uploads the pinned bytes even when the original file changes after approval', async () => {
+  it('uploads exactly the pinned bytes after the original file is replaced or removed', async () => {
     const approvedBytes = Buffer.from('%PDF-1.7 approved');
-    const replacedBytes = Buffer.from('%PDF-1.7 replaced after approval');
     const original = path.join(baseDir, 'changing.pdf');
     await fs.writeFile(original, approvedBytes);
     const params = { file_name: 'changing.pdf', file_path: original };
 
     const prepared = await required(CreateAttachableTool.prepareApproval)({ params }, callSignal);
     expect(prepared.facts).toMatchObject({ sha256: sha256(approvedBytes) });
-    await fs.writeFile(original, replacedBytes);
+    await fs.writeFile(original, Buffer.from('%PDF-1.7 replaced after approval'));
+    await fs.rm(original);
     const captured = mockStreamingUploadResponse(200, { AttachableResponse: [{ Attachable: { Id: '9' } }] });
 
     const result = await prepared.handler({ params }, extra);
-    await prepared.dispose();
 
     expect(result.content[0]).toEqual({ type: 'text', text: 'Attachable created:' });
     expect(mockHttpsRequest).toHaveBeenCalledTimes(1);
-    expect(captured.body.includes(approvedBytes)).toBe(true);
-    expect(captured.body.includes(replacedBytes)).toBe(false);
+    expect(uploadedFilePart(captured.body, 'changing.pdf')).toEqual(approvedBytes);
     expect(captured.body.toString('utf8', 0, 600)).toContain('Content-Type: application/pdf');
-  });
-
-  it('refuses to upload when the pinned copy no longer matches the approved hash', async () => {
-    const original = path.join(baseDir, 'tamper.pdf');
-    await fs.writeFile(original, Buffer.from('%PDF-1.7 approved'));
-    const data = { file_name: 'tamper.pdf', file_path: original };
-    const pinned = required(await pinAttachableSource(data, callSignal));
-    await fs.writeFile(pinned.source.path, Buffer.from('%PDF-1.7 tampered'));
-
-    const result = await createQuickbooksAttachable(data, pinned.source);
-    await pinned.dispose();
-
-    expect(result).toEqual({
-      result: null,
-      isError: true,
-      error: 'Pinned file content changed after approval; nothing was uploaded.',
-    });
-    expect(mockHttpsRequest).not.toHaveBeenCalled();
   });
 
   it('fails before approval for a path the allowlist rejects', async () => {
     const hidden = path.join(baseDir, '.hidden.pdf');
     await fs.writeFile(hidden, Buffer.from('%PDF'));
-    const before = await pinDirs();
 
     await expect(
       required(CreateAttachableTool.prepareApproval)({ params: { file_name: 'x.pdf', file_path: hidden } }, callSignal)
     ).rejects.toThrow('file_path denied: dotfiles and dot-directories are not attachable');
 
-    expect(await pinDirs()).toEqual(before);
     expect(mockHttpsRequest).not.toHaveBeenCalled();
   });
+});
 
-  it('fails and removes the temp directory when fewer bytes than expected are read', async () => {
-    const original = path.join(baseDir, 'short.pdf');
+describe('readFileSnapshot', () => {
+  it.each([
+    ['shrank', 20],
+    ['grew', 5],
+  ])('fails when the file %s after its size was checked', async (_label, expectedSize) => {
+    const original = path.join(baseDir, `resized-${expectedSize}.pdf`);
     await fs.writeFile(original, Buffer.alloc(10, 1));
-    const before = await pinDirs();
 
-    await expect(pinLocalFile({ path: original, size: 20 })).rejects.toThrow(
-      'file_path changed while it was being read: read 10 of 20 expected bytes.'
+    await expect(readFileSnapshot(original, expectedSize)).rejects.toThrow(
+      `File changed while it was being read: expected ${expectedSize} bytes.`
     );
-    expect(await pinDirs()).toEqual(before);
   });
 });
 
 describe('pinAttachableSource with file_url', () => {
-  it('downloads before approval and uploads the downloaded file without fetching again', async () => {
+  it('deletes the download before returning and uploads the snapshot without fetching again', async () => {
     const bytes = Buffer.from('%PDF-1.7 downloaded');
     (mockFetch as any).mockResolvedValue(
       new Response(new Uint8Array(bytes), { status: 200, headers: { 'content-type': 'application/pdf' } })
     );
-    const data = { file_name: 'download', file_url: 'https://example.com/files/r.pdf' };
+    const data = { file_name: 'download.pdf', file_url: 'https://example.com/files/r.pdf' };
+    const before = await tempFiles();
 
     const pinned = required(await pinAttachableSource(data, callSignal));
+    expect(await tempFiles()).toEqual(before);
     expect(pinned.facts).toEqual({
       source: 'file_url',
       bytes: bytes.length,
       sha256: sha256(bytes),
       content_type_header: 'application/pdf',
     });
+    expect(pinned.source.buffer).toEqual(bytes);
     expect(mockFetch).toHaveBeenCalledTimes(1);
 
     const captured = mockStreamingUploadResponse(200, { ok: true });
     const result = await createQuickbooksAttachable(data, pinned.source);
     expect(result.isError).toBe(false);
-    expect(captured.body.includes(bytes)).toBe(true);
+    expect(uploadedFilePart(captured.body, 'download.pdf')).toEqual(bytes);
     expect(mockFetch).toHaveBeenCalledTimes(1);
-
-    expect(await exists(pinned.source.path)).toBe(true);
-    await pinned.dispose();
-    expect(await exists(pinned.source.path)).toBe(false);
   });
 
   it('omits the content type fact when the response has no Content-Type header', async () => {
@@ -229,20 +204,6 @@ describe('pinAttachableSource with file_url', () => {
     );
     expect(pinned.facts).not.toHaveProperty('content_type_header');
     expect(pinned.source.contentTypeHeader).toBeNull();
-    await pinned.dispose();
-  });
-
-  it('cleans up the download when it cannot be hashed', async () => {
-    const cleanup = jest.fn(async () => undefined);
-    await expect(
-      pinFetchedFile({
-        path: path.join(baseDir, 'missing-download.tmp'),
-        size: 1,
-        contentTypeHeader: null,
-        cleanup,
-      })
-    ).rejects.toThrow();
-    expect(cleanup).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -252,12 +213,9 @@ describe('create_attachable approval preparation without a single file reference
     ['metadata only', { file_name: 'a.txt' }],
     ['conflicting file_path and file_url', { file_name: 'a.pdf', file_path: '/x.pdf', file_url: 'https://example.com/a.pdf' }],
   ])('pins nothing for %s and uses the unpinned handler', async (_label, params) => {
-    const before = await pinDirs();
     const prepared = await required(CreateAttachableTool.prepareApproval)({ params }, callSignal);
     expect(prepared.facts).toEqual({});
     expect(prepared.handler).toBe(CreateAttachableTool.handler);
-    await expect(prepared.dispose()).resolves.toBeUndefined();
-    expect(await pinDirs()).toEqual(before);
     expect(mockFetch).not.toHaveBeenCalled();
   });
 });
@@ -277,13 +235,11 @@ describe('create_attachable allow-mode handler', () => {
     const current = Buffer.from('%PDF-1.7 current at execution');
     await fs.writeFile(original, current);
     const captured = mockStreamingUploadResponse(200, { ok: true });
-    const before = await pinDirs();
 
     const result = await CreateAttachableTool.handler({ params: { file_name: 'allow.pdf', file_path: original } }, extra);
 
     expect(result.content[0]).toEqual({ type: 'text', text: 'Attachable created:' });
-    expect(captured.body.includes(current)).toBe(true);
-    expect(await pinDirs()).toEqual(before);
+    expect(uploadedFilePart(captured.body, 'allow.pdf')).toEqual(current);
   });
 });
 

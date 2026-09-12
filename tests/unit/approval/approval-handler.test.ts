@@ -323,6 +323,32 @@ describe("createApprovalHandler denials", () => {
     expect(events[1]).toMatchObject({ outcome: "approval-error", error: expect.any(String) });
   });
 
+  it("redacts argument values from denial audit errors", async () => {
+    const ctx = setup();
+    ctx.elicitInput.mockRejectedValueOnce(new Error("Client could not render Website redesign"));
+    await ctx.call();
+    expect(readAudit(ctx.auditLogPath as string)[1]).toMatchObject({
+      outcome: "approval-error",
+      error: "Client could not render [REDACTED]",
+    });
+  });
+
+  it("summarizes long string arguments in the prompt while hashing their full value", async () => {
+    const ctx = setup();
+    const content = "A".repeat(5_000);
+    const changed = `${content.slice(0, -1)}B`;
+    await ctx.call({ params: { base64_content: content } });
+    ctx.elicitInput.mockResolvedValueOnce({ action: "decline" });
+    await ctx.call({ params: { base64_content: changed } });
+
+    const [first, second] = ctx.elicitInput.mock.calls.map(([params]) => params.message);
+    expect(first).toContain(`- base64_content: <string: 5000 characters, SHA-256 ${sha256Hex(content)}>`);
+    expect(first).not.toContain(content);
+    const hashes = [first, second].map((message) => /^Payload SHA-256: (.+)$/m.exec(message)?.[1]);
+    expect(hashes).toEqual([expectedHash({ params: { base64_content: content } }), expectedHash({ params: { base64_content: changed } })]);
+    expect(hashes[0]).not.toBe(hashes[1]);
+  });
+
   it("blocks when the arguments cannot be canonicalized", async () => {
     const ctx = setup();
     const result = await ctx.call({ params: { invoice: { TotalAmt: Number.NaN } } });
@@ -441,6 +467,26 @@ describe("createApprovalHandler execution outcomes", () => {
     expect(events[2]).not.toHaveProperty("entityId");
   });
 
+  it("redacts argument values of 6 or more characters from execution failure text but not shorter ones", async () => {
+    const ctx = setup({
+      inner: async () => ({
+        content: [{ type: "text", text: 'Error updating invoice 10428: memo "Website redesign" rejected, SyncToken 3 stale' }],
+      }),
+    });
+    await ctx.call();
+    expect(readAudit(ctx.auditLogPath as string)[2]).toMatchObject({
+      outcome: "execution-failed",
+      error: 'Error updating invoice 10428: memo "[REDACTED]" rejected, SyncToken 3 stale',
+    });
+  });
+
+  it("redacts argument values and credentials from thrown execution errors", async () => {
+    const failure = new Error("Duplicate note Website redesign; Authorization: Bearer abc.def.ghi");
+    const ctx = setup({ inner: async () => { throw failure; } });
+    await expect(ctx.call()).rejects.toBe(failure);
+    expect(readAudit(ctx.auditLogPath as string)[2].error).toBe("Duplicate note [REDACTED]; Authorization: [REDACTED]");
+  });
+
   it.each([
     ["a nested Id", [{ type: "text", text: "Created:" }, { type: "text", text: JSON.stringify({ Invoice: { Id: 42 } }) }], "42"],
     ["a later nested object", [{ type: "text", text: JSON.stringify({ time: 1, Bill: { Id: "7" } }) }], "7"],
@@ -527,9 +573,8 @@ describe("createApprovalHandler pinned inputs", () => {
 
   function pinning(overrides: Partial<PreparedApproval> = {}) {
     const pinnedHandler = jest.fn<InnerFn>(async () => SUCCESS);
-    const dispose = jest.fn<() => Promise<void>>(async () => undefined);
-    const prepare = jest.fn<PrepareFn>(async () => ({ facts: FACTS, handler: pinnedHandler, dispose, ...overrides }));
-    return { pinnedHandler, dispose, prepare };
+    const prepare = jest.fn<PrepareFn>(async () => ({ facts: FACTS, handler: pinnedHandler, ...overrides }));
+    return { pinnedHandler, prepare };
   }
 
   it("binds pinned facts into the hash and summary and runs the pinned handler", async () => {
@@ -544,6 +589,8 @@ describe("createApprovalHandler pinned inputs", () => {
     expect(pin.prepare).toHaveBeenCalledTimes(1);
     expect(pin.prepare.mock.calls[0][0]).toEqual(args);
     expect(pin.prepare.mock.calls[0][0]).not.toBe(args);
+    expect(Object.isFrozen(pin.prepare.mock.calls[0][0])).toBe(true);
+    expect(Object.isFrozen(pin.prepare.mock.calls[0][0].params)).toBe(true);
     expect(pin.prepare.mock.calls[0][1]).toBe(ctx.controller.signal);
     expect(pin.pinnedHandler).toHaveBeenCalledTimes(1);
     expect(pin.pinnedHandler.mock.calls[0][0]).toEqual(args);
@@ -557,8 +604,6 @@ describe("createApprovalHandler pinned inputs", () => {
 
     expect(ctx.realmId.mock.invocationCallOrder[0]).toBeLessThan(pin.prepare.mock.invocationCallOrder[0]);
     expect(pin.prepare.mock.invocationCallOrder[0]).toBeLessThan(issue.mock.invocationCallOrder[0]);
-    expect(pin.dispose).toHaveBeenCalledTimes(1);
-    expect(pin.pinnedHandler.mock.invocationCallOrder[0]).toBeLessThan(pin.dispose.mock.invocationCallOrder[0]);
   });
 
   it("includes an empty pinned object in the hash when the hook pins nothing", async () => {
@@ -574,7 +619,7 @@ describe("createApprovalHandler pinned inputs", () => {
     const pin = pinning();
     pin.prepare.mockImplementationOnce(async () => {
       clock.now = 10_000;
-      return { facts: FACTS, handler: pin.pinnedHandler, dispose: pin.dispose };
+      return { facts: FACTS, handler: pin.pinnedHandler };
     });
     const ctx = setup({ prepare: pin.prepare, timeoutMs: 1_000, store: new ApprovalStore(() => clock.now), now: () => clock.now });
     await ctx.call();
@@ -586,7 +631,7 @@ describe("createApprovalHandler pinned inputs", () => {
     ["the user declines", (ctx: ReturnType<typeof setup>) => ctx.elicitInput.mockResolvedValueOnce({ action: "decline" }), "declined"],
     ["elicitation fails", (ctx: ReturnType<typeof setup>) => ctx.elicitInput.mockRejectedValueOnce(new Error("boom")), "approval-error"],
     ["the realm changes", (ctx: ReturnType<typeof setup>) => ctx.realmId.mockResolvedValueOnce("9130").mockResolvedValueOnce("1"), "hash-mismatch"],
-  ] as const)("disposes pinned inputs when %s", async (_label, arrange, outcome) => {
+  ] as const)("does not run the pinned handler when %s", async (_label, arrange, outcome) => {
     const pin = pinning();
     const ctx = setup({ prepare: pin.prepare });
     arrange(ctx);
@@ -594,16 +639,6 @@ describe("createApprovalHandler pinned inputs", () => {
     expect(blockedText(result)).toContain(`(${outcome})`);
     expect(pin.pinnedHandler).not.toHaveBeenCalled();
     expect(ctx.inner).not.toHaveBeenCalled();
-    expect(pin.dispose).toHaveBeenCalledTimes(1);
-  });
-
-  it("disposes pinned inputs when the pinned handler throws", async () => {
-    const failure = new Error("upload failed");
-    const pin = pinning();
-    pin.pinnedHandler.mockRejectedValueOnce(failure);
-    const ctx = setup({ prepare: pin.prepare });
-    await expect(ctx.call()).rejects.toBe(failure);
-    expect(pin.dispose).toHaveBeenCalledTimes(1);
   });
 
   it("does not pin for an unsupported client", async () => {
@@ -611,23 +646,24 @@ describe("createApprovalHandler pinned inputs", () => {
     const ctx = setup({ prepare: pin.prepare, capabilities: {} });
     await ctx.call();
     expect(pin.prepare).not.toHaveBeenCalled();
-    expect(pin.dispose).not.toHaveBeenCalled();
   });
 
-  it("blocks without prompting when pinning fails", async () => {
+  it("blocks without prompting when pinning fails, keeping the helper message out of the audit log", async () => {
     const pin = pinning();
-    pin.prepare.mockRejectedValueOnce(new Error("file_path denied: dotfiles and dot-directories are not attachable"));
+    const filePath = "/home/me/Client Files/receipt.pdf";
+    pin.prepare.mockRejectedValueOnce(new Error(`file_path not found or not readable: ${filePath}`));
     const ctx = setup({ prepare: pin.prepare });
-    const result = await ctx.call();
+    const result = await ctx.call({ params: { file_name: "receipt.pdf", file_path: filePath } });
     expect(ctx.inner).not.toHaveBeenCalled();
     expect(pin.pinnedHandler).not.toHaveBeenCalled();
     expect(ctx.elicitInput).not.toHaveBeenCalled();
     expect(blockedText(result)).toContain(
-      "(approval-error): the tool's external input could not be pinned for approval (file_path denied: dotfiles and dot-directories are not attachable)"
+      `(approval-error): the tool's external input could not be pinned for approval (file_path not found or not readable: ${filePath})`
     );
     expect(readAudit(ctx.auditLogPath as string)).toEqual([
-      expect.objectContaining({ outcome: "approval-error", approvalId: null, payloadHash: null, error: expect.stringContaining("file_path denied") }),
+      expect.objectContaining({ outcome: "approval-error", approvalId: null, payloadHash: null, error: "external input could not be pinned" }),
     ]);
+    expect(fs.readFileSync(ctx.auditLogPath as string, "utf8")).not.toContain("Client Files");
   });
 
   it("denies as canceled when the call is canceled while pinning fails", async () => {
@@ -645,44 +681,26 @@ describe("createApprovalHandler pinned inputs", () => {
     expect(outcomes(ctx.auditLogPath)).toEqual(["canceled"]);
   });
 
-  it("denies as canceled and disposes when the call is canceled after pinning succeeds", async () => {
+  it("denies as canceled when the call is canceled after pinning succeeds", async () => {
     const pin = pinning();
     const ctx = setup({ prepare: pin.prepare });
     pin.prepare.mockImplementationOnce(async () => {
       ctx.controller.abort();
-      return { facts: FACTS, handler: pin.pinnedHandler, dispose: pin.dispose };
+      return { facts: FACTS, handler: pin.pinnedHandler };
     });
     const result = await ctx.call();
     expect(blockedText(result)).toContain("(canceled): the tool call was canceled while its external input was being pinned");
     expect(ctx.elicitInput).not.toHaveBeenCalled();
     expect(pin.pinnedHandler).not.toHaveBeenCalled();
-    expect(pin.dispose).toHaveBeenCalledTimes(1);
     expect(outcomes(ctx.auditLogPath)).toEqual(["canceled"]);
   });
 
-  it("reports a dispose failure on stderr without changing a successful result", async () => {
-    const errorSpy = jest.spyOn(console, "error").mockImplementation(() => undefined);
-    const pin = pinning();
-    pin.dispose.mockRejectedValueOnce(new Error("EBUSY Authorization: Bearer abc.def.ghi"));
-    const ctx = setup({ prepare: pin.prepare });
-    const result = await ctx.call();
-    expect(result).toBe(SUCCESS);
-    expect(pin.pinnedHandler).toHaveBeenCalledTimes(1);
-    expect(errorSpy).toHaveBeenCalledTimes(1);
-    expect(errorSpy.mock.calls[0][0]).toMatch(/^QuickBooks approval pinned input cleanup failed \(approval [0-9a-f-]{36}\): /);
-    expect(errorSpy.mock.calls[0][0]).toContain("[REDACTED]");
-    expect(errorSpy.mock.calls[0][0]).not.toContain("abc.def.ghi");
-  });
-
-  it("reports a dispose failure on stderr without executing a denied call", async () => {
-    const errorSpy = jest.spyOn(console, "error").mockImplementation(() => undefined);
+  it("blocks without prompting when the pinned facts cannot be canonicalized", async () => {
     const pin = pinning({ facts: { bytes: Number.NaN } });
-    pin.dispose.mockRejectedValueOnce(new Error("EBUSY"));
     const ctx = setup({ prepare: pin.prepare });
     const result = await ctx.call();
     expect(blockedText(result)).toContain("(approval-error): the pinned input facts could not be canonicalized");
     expect(ctx.elicitInput).not.toHaveBeenCalled();
     expect(pin.pinnedHandler).not.toHaveBeenCalled();
-    expect(errorSpy).toHaveBeenCalledWith("QuickBooks approval pinned input cleanup failed (approval n/a): EBUSY");
   });
 });

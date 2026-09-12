@@ -1,4 +1,5 @@
 import https from "https";
+import { createHash } from "crypto";
 import { createReadStream } from "fs";
 import { QuickbooksClient } from "../clients/quickbooks-client.js";
 import { ToolResponse } from "../types/tool-response.js";
@@ -6,11 +7,8 @@ import { formatError } from "../helpers/format-error.js";
 import {
   fetchUrlToTempFile,
   inferContentType,
-  pinFetchedFile,
-  pinLocalFile,
+  readFileSnapshot,
   resolveLocalFile,
-  sha256File,
-  type PinnedFile,
 } from "../helpers/attachable-file-source.js";
 
 // QBO Attachable upload — file types accepted by the QBO /upload endpoint.
@@ -73,8 +71,9 @@ export interface CreateAttachableInput {
 }
 
 // The file part of the multipart body: either bytes already in memory
-// (base64 path) or a local file streamed from disk (file_path / file_url,
-// the latter spooled to a temp file by the fetch helper).
+// (base64 path or pinned content) or a local file streamed from disk
+// (unpinned file_path / file_url, the latter spooled to a temp file by the
+// fetch helper).
 type UploadFileSource = { buffer: Buffer } | { path: string; size: number };
 
 function sanitizeFilename(name: string): string {
@@ -214,22 +213,29 @@ async function uploadAttachableFile(
   });
 }
 
-/** A file source already resolved, validated, and hashed before approval. */
-export type PinnedAttachableSource = Pick<PinnedFile, "path" | "size" | "sha256" | "contentTypeHeader">;
+/**
+ * File content resolved, validated, and read into memory before approval.
+ * The buffer is owned by the pending call and never written, so the uploaded
+ * bytes are the ones hashed into the approval.
+ */
+export interface PinnedAttachableSource {
+  buffer: Buffer;
+  contentTypeHeader: string | null;
+}
 
 export interface PinnedAttachable {
   facts: Record<string, string | number>;
   source: PinnedAttachableSource;
-  dispose: () => Promise<void>;
 }
 
 /**
  * Resolves file_path or file_url with the same checks as an unpinned upload
- * and pins the bytes: a local file is copied to a private temp directory, and
- * a URL is downloaded (a GET to that URL, no QuickBooks request). Returns null
- * when there is no single file reference to pin (base64 bytes are already
- * part of the arguments; conflicting or absent references are handled by
- * createQuickbooksAttachable).
+ * and snapshots the bytes in memory (at most MAX_UPLOAD_BYTES): a local file
+ * is read once, and a URL is downloaded (a GET to that URL, no QuickBooks
+ * request) to a temp file that is read and deleted before this returns.
+ * Returns null when there is no single file reference to pin (base64 bytes are
+ * already part of the arguments; conflicting or absent references are handled
+ * by createQuickbooksAttachable).
  */
 export async function pinAttachableSource(
   data: CreateAttachableInput,
@@ -237,24 +243,31 @@ export async function pinAttachableSource(
 ): Promise<PinnedAttachable | null> {
   if (data.file_url && data.file_path) return null;
   if (data.file_url) {
-    const pinned = await pinFetchedFile(await fetchUrlToTempFile(data.file_url, MAX_UPLOAD_BYTES, signal));
-    const facts: Record<string, string | number> = { source: "file_url", bytes: pinned.size, sha256: pinned.sha256 };
-    if (pinned.contentTypeHeader !== null) facts.content_type_header = pinned.contentTypeHeader;
-    return { facts, source: pinned, dispose: pinned.dispose };
+    const fetched = await fetchUrlToTempFile(data.file_url, MAX_UPLOAD_BYTES, signal);
+    let buffer: Buffer;
+    try {
+      buffer = await readFileSnapshot(fetched.path, fetched.size);
+    } finally {
+      await fetched.cleanup();
+    }
+    return pinnedAttachable("file_url", buffer, fetched.contentTypeHeader);
   }
   if (!data.file_path) return null;
-  const pinned = await pinLocalFile(await resolveLocalFile(data.file_path, MAX_UPLOAD_BYTES));
-  return {
-    facts: { source: "file_path", bytes: pinned.size, sha256: pinned.sha256 },
-    source: pinned,
-    dispose: pinned.dispose,
-  };
+  const local = await resolveLocalFile(data.file_path, MAX_UPLOAD_BYTES);
+  return pinnedAttachable("file_path", await readFileSnapshot(local.path, local.size), null);
 }
 
-/**
- * With `pinned`, uploads that pre-resolved file instead of reading file_path or
- * downloading file_url, and refuses to upload if its SHA-256 no longer matches.
- */
+function pinnedAttachable(source: "file_path" | "file_url", buffer: Buffer, contentTypeHeader: string | null): PinnedAttachable {
+  const facts: Record<string, string | number> = {
+    source,
+    bytes: buffer.length,
+    sha256: createHash("sha256").update(buffer).digest("hex"),
+  };
+  if (contentTypeHeader !== null) facts.content_type_header = contentTypeHeader;
+  return { facts, source: { buffer, contentTypeHeader } };
+}
+
+/** With `pinned`, uploads that snapshot instead of reading file_path or downloading file_url. */
 export async function createQuickbooksAttachable(
   data: CreateAttachableInput,
   pinned?: PinnedAttachableSource
@@ -297,7 +310,7 @@ export async function createQuickbooksAttachable(
       let cleanup: (() => Promise<void>) | null = null;
 
       if (pinned) {
-        fileSource = { path: pinned.path, size: pinned.size };
+        fileSource = { buffer: pinned.buffer };
         fetchedContentType = pinned.contentTypeHeader;
       } else if (data.file_url) {
         const fetched = await fetchUrlToTempFile(data.file_url, MAX_UPLOAD_BYTES);
@@ -370,13 +383,6 @@ export async function createQuickbooksAttachable(
 
         const { accessToken, realmId, isSandbox } =
           await QuickbooksClient.getAuthCredentials();
-        if (pinned && (await sha256File(pinned.path)) !== pinned.sha256) {
-          return {
-            result: null,
-            isError: true,
-            error: "Pinned file content changed after approval; nothing was uploaded.",
-          };
-        }
         const uploadResult = await uploadAttachableFile(
           fileSource,
           payload,

@@ -14,7 +14,13 @@ import { QuickbooksClient } from "../clients/quickbooks-client.js";
 import type { MutationCategory } from "../helpers/register-tool.js";
 import type { PreparedApproval, ToolDefinition } from "../types/tool-definition.js";
 import type { ApprovalConfig } from "./approval-config.js";
-import { sanitizeErrorMessage, writeAuditEvent, type AuditEvent, type AuditOutcome } from "./approval-audit.js";
+import {
+  collectRedactableValues,
+  sanitizeErrorMessage,
+  writeAuditEvent,
+  type AuditEvent,
+  type AuditOutcome,
+} from "./approval-audit.js";
 import { approvalStore, type ApprovalStore, type ConsumeFailure } from "./approval-store.js";
 import { buildApprovalMessage } from "./approval-summary.js";
 import { canonicalJson, sha256Hex } from "./canonicalize.js";
@@ -23,15 +29,18 @@ type Extra = RequestHandlerExtra<ServerRequest, ServerNotification>;
 
 type AnyToolDefinition = ToolDefinition<z.ZodType<any, any>>;
 
-type Pinned = { prepared: PreparedApproval | null };
-
 type DenialOutcome = Exclude<AuditOutcome, "requested" | "approved" | "executed" | "execution-failed">;
 
+/** `cause` becomes the audit `error`, sanitized with the call's argument values redacted. */
 type Decision =
-  | { approved: true; argsJson: string }
-  | { approved: false; outcome: DenialOutcome; reason: string; error?: string };
+  | { approved: true; argsJson: string; prepared: PreparedApproval | null }
+  | { approved: false; outcome: DenialOutcome; reason: string; cause?: unknown };
 
 type AuditContext = Pick<AuditEvent, "approvalId" | "toolName" | "category" | "payloadHash" | "realmId">;
+
+// The helper's message usually repeats the file_path or file_url, so only the
+// client-facing denial text carries it.
+const PIN_FAILURE_AUDIT_ERROR = "external input could not be pinned";
 
 const CONSUME_DENIAL: Record<ConsumeFailure, { outcome: DenialOutcome; reason: string }> = {
   expired: { outcome: "expired", reason: "the approval expired before it was used" },
@@ -100,43 +109,34 @@ export function createApprovalHandler(
       payloadHash: null,
       realmId: null,
     };
-    const pinned: Pinned = { prepared: null };
-    try {
-      return await approveAndExecute(env, context, pinned, args, extra);
-    } finally {
-      if (pinned.prepared !== null) await disposeOrReport(pinned.prepared, context);
-    }
+    return approveAndExecute(env, context, collectRedactableValues(args), args, extra);
   };
 }
 
 async function approveAndExecute(
   env: CallEnvironment,
   context: AuditContext,
-  pinned: Pinned,
+  redactValues: readonly string[],
   args: unknown,
   extra: Extra
 ): Promise<CallToolResult> {
   const { config } = env;
   let decision: Decision;
   try {
-    decision = await obtainApproval(env, context, pinned, args, extra);
+    decision = await obtainApproval(env, context, args, extra);
   } catch (err) {
-    decision = {
-      approved: false,
-      outcome: "approval-error",
-      reason: "an internal approval error occurred",
-      error: sanitizeErrorMessage(err),
-    };
+    decision = denial("approval-error", "an internal approval error occurred", err);
   }
 
-  if (!decision.approved) return deny(config, context, decision);
+  if (!decision.approved) return deny(config, context, redactValues, decision);
 
-  const handler = pinned.prepared?.handler ?? env.definition.handler;
+  const handler = decision.prepared?.handler ?? env.definition.handler;
   let result: CallToolResult;
   try {
+    // Handlers may mutate their input, so they get a copy rather than the frozen approved value.
     result = await handler(JSON.parse(decision.argsJson), extra);
   } catch (err) {
-    writeAuditOrReport(config, { ...context, outcome: "execution-failed", error: sanitizeErrorMessage(err) });
+    writeAuditOrReport(config, { ...context, outcome: "execution-failed", error: sanitizeErrorMessage(err, redactValues) });
     throw err;
   }
 
@@ -144,7 +144,7 @@ async function approveAndExecute(
   if (failureText === null) {
     writeAuditOrReport(config, { ...context, outcome: "executed", entityId: extractEntityId(result) });
   } else {
-    writeAuditOrReport(config, { ...context, outcome: "execution-failed", error: sanitizeErrorMessage(failureText) });
+    writeAuditOrReport(config, { ...context, outcome: "execution-failed", error: sanitizeErrorMessage(failureText, redactValues) });
   }
   return result;
 }
@@ -152,7 +152,6 @@ async function approveAndExecute(
 async function obtainApproval(
   env: CallEnvironment,
   context: AuditContext,
-  pinned: Pinned,
   args: unknown,
   extra: Extra
 ): Promise<Decision> {
@@ -164,6 +163,9 @@ async function obtainApproval(
   } catch (err) {
     return denial("approval-error", "the tool arguments could not be canonicalized", err);
   }
+  // One frozen copy shared by pinning, hashing, and the summary, so none of
+  // them can change what the others see.
+  const approvedArgs = deepFreeze(JSON.parse(argsJson));
 
   if (!server.server.getClientCapabilities()?.elicitation?.form) {
     return denial(
@@ -178,24 +180,25 @@ async function obtainApproval(
     return denial("approval-error", "the QuickBooks company (realm) ID could not be determined", err);
   }
 
+  let prepared: PreparedApproval | null = null;
   if (definition.prepareApproval) {
     try {
-      pinned.prepared = await definition.prepareApproval(JSON.parse(argsJson), extra.signal);
+      prepared = await definition.prepareApproval(approvedArgs, extra.signal);
     } catch (err) {
       if (extra.signal.aborted) {
         return denial("canceled", "the tool call was canceled while its external input was being pinned", err);
       }
-      const error = sanitizeErrorMessage(err);
-      return { approved: false, outcome: "approval-error", reason: `the tool's external input could not be pinned for approval (${error})`, error };
+      const reason = `the tool's external input could not be pinned for approval (${sanitizeErrorMessage(err)})`;
+      return denial("approval-error", reason, PIN_FAILURE_AUDIT_ERROR);
     }
   }
   if (extra.signal.aborted) {
     return denial("canceled", "the tool call was canceled while its external input was being pinned");
   }
-  const facts = pinned.prepared?.facts;
+  const facts = prepared?.facts;
 
   try {
-    context.payloadHash = payloadHashOf(context, JSON.parse(argsJson), facts);
+    context.payloadHash = payloadHashOf(context, approvedArgs, facts);
   } catch (err) {
     return denial("approval-error", "the pinned input facts could not be canonicalized", err);
   }
@@ -224,7 +227,7 @@ async function obtainApproval(
         message: buildApprovalMessage({
           toolName: context.toolName,
           category: context.category,
-          args: JSON.parse(argsJson),
+          args: approvedArgs,
           realmId: context.realmId,
           pinned: facts,
           approvalId: record.id,
@@ -281,7 +284,7 @@ async function obtainApproval(
     return denial("canceled", "the tool call was canceled before execution");
   }
 
-  const consumed = store.consume(record.id, context.toolName, payloadHashOf(context, JSON.parse(argsJson), facts));
+  const consumed = store.consume(record.id, context.toolName, payloadHashOf(context, approvedArgs, facts));
   if (!consumed.ok) {
     const { outcome, reason } = CONSUME_DENIAL[consumed.reason];
     return denial(outcome, reason);
@@ -293,7 +296,7 @@ async function obtainApproval(
     return denial("approval-error", "the approval audit log could not be written", err);
   }
 
-  return { approved: true, argsJson };
+  return { approved: true, argsJson, prepared };
 }
 
 /** `pinned` is omitted from the hashed object when the tool has no prepare hook, so those hashes are unaffected. */
@@ -309,19 +312,18 @@ function payloadHashOf(context: AuditContext, args: unknown, pinned: PreparedApp
   );
 }
 
-function denial(outcome: DenialOutcome, reason: string, err?: unknown): Decision {
-  return err === undefined
-    ? { approved: false, outcome, reason }
-    : { approved: false, outcome, reason, error: sanitizeErrorMessage(err) };
+function denial(outcome: DenialOutcome, reason: string, cause?: unknown): Extract<Decision, { approved: false }> {
+  return cause === undefined ? { approved: false, outcome, reason } : { approved: false, outcome, reason, cause };
 }
 
 function deny(
   config: ApprovalConfig,
   context: AuditContext,
+  redactValues: readonly string[],
   decision: Extract<Decision, { approved: false }>
 ): CallToolResult {
   const event: AuditEvent = { ...context, outcome: decision.outcome };
-  if (decision.error !== undefined) event.error = decision.error;
+  if (decision.cause !== undefined) event.error = sanitizeErrorMessage(decision.cause, redactValues);
   writeAuditOrReport(config, event);
   return {
     isError: true,
@@ -345,15 +347,12 @@ function writeAuditOrReport(config: ApprovalConfig, event: AuditEvent): void {
   }
 }
 
-/** A cleanup failure must not change the call's result, so it is reported on stderr. */
-async function disposeOrReport(prepared: PreparedApproval, context: AuditContext): Promise<void> {
-  try {
-    await prepared.dispose();
-  } catch (err) {
-    console.error(
-      `QuickBooks approval pinned input cleanup failed (approval ${context.approvalId ?? "n/a"}): ${sanitizeErrorMessage(err)}`
-    );
+function deepFreeze<T>(value: T): T {
+  if (typeof value === "object" && value !== null) {
+    for (const member of Object.values(value)) deepFreeze(member);
+    Object.freeze(value);
   }
+  return value;
 }
 
 function executionFailureText(result: CallToolResult): string | null {

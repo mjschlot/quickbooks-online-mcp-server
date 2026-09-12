@@ -1,4 +1,5 @@
 import type { MutationCategory } from "../helpers/register-tool.js";
+import { sha256Hex } from "./canonicalize.js";
 
 export interface ApprovalMessageInput {
   toolName: string;
@@ -29,6 +30,10 @@ const UNSAFE_CHARACTER = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu;
 // cannot render like a genuine nested path.
 const PLAIN_KEY = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
 const FILE_REFERENCE_KEYS = ["file_path", "file_url"];
+// QuickBooks text fields hold at most about 4,000 characters, so ordinary text
+// stays fully visible; longer strings (such as base64 file content) are shown
+// by length and hash, and the payload hash still covers the full value.
+const MAX_DISPLAYED_STRING_LENGTH = 4_096;
 
 export function buildApprovalMessage(input: ApprovalMessageInput): string {
   const entity = input.toolName
@@ -122,6 +127,9 @@ function displayPath(path: string): string {
 }
 
 function renderValue(value: unknown): string {
+  if (typeof value === "string" && value.length > MAX_DISPLAYED_STRING_LENGTH) {
+    return `<string: ${value.length} characters, SHA-256 ${sha256Hex(value)}>`;
+  }
   return JSON.stringify(value) ?? String(value);
 }
 

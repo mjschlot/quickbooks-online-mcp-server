@@ -1,6 +1,5 @@
 import { lookup } from "dns/promises";
-import { createReadStream, createWriteStream } from "fs";
-import { createHash, randomBytes } from "crypto";
+import { randomBytes } from "crypto";
 import { Readable } from "stream";
 import { pipeline } from "stream/promises";
 import { Transform } from "stream";
@@ -373,64 +372,24 @@ async function spoolToTempFile(current: URL, maxBytes: number, signal: AbortSign
 
 // ── pinned content ────────────────────────────────────────────────────────
 
-export interface PinnedFile extends LocalFileSource {
-  sha256: string;
-  contentTypeHeader: string | null;
-  dispose: () => Promise<void>;
-}
-
-export async function sha256File(filePath: string): Promise<string> {
-  const hash = createHash("sha256");
-  for await (const chunk of createReadStream(filePath)) hash.update(chunk);
-  return hash.digest("hex");
-}
-
-// Copies exactly source.size bytes into a new private temp directory (0700
-// from mkdtemp, file 0600) and hashes them in the same pass, so later changes
-// to the original file cannot alter the pinned bytes.
-export async function pinLocalFile(source: LocalFileSource): Promise<PinnedFile> {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "qbo-attach-pin-"));
-  const dispose = () => fs.rm(dir, { recursive: true, force: true });
-  const pinnedPath = path.join(dir, "content");
-  const hash = createHash("sha256");
-  let bytes = 0;
-  const hasher = new Transform({
-    transform(chunk: Buffer, _enc, cb) {
-      hash.update(chunk);
-      bytes += chunk.length;
-      cb(null, chunk);
-    },
-  });
+// Reads exactly `size` bytes into a new Buffer. A file that is shorter or
+// longer than `size` changed after it was checked, so the read fails rather
+// than snapshot content that bypassed the size cap or was cut short.
+export async function readFileSnapshot(filePath: string, size: number): Promise<Buffer> {
+  const handle = await fs.open(filePath, "r");
   try {
-    await pipeline(
-      createReadStream(source.path, { end: source.size - 1 }),
-      hasher,
-      createWriteStream(pinnedPath, { flags: "wx", mode: 0o600 })
-    );
-    if (bytes !== source.size) {
-      throw new Error(`file_path changed while it was being read: read ${bytes} of ${source.size} expected bytes.`);
+    const buffer = Buffer.allocUnsafe(size + 1);
+    let bytes = 0;
+    while (bytes <= size) {
+      const { bytesRead } = await handle.read(buffer, bytes, size + 1 - bytes, bytes);
+      if (bytesRead === 0) break;
+      bytes += bytesRead;
     }
-  } catch (err) {
-    await dispose().catch(swallow);
-    throw err;
+    if (bytes !== size) {
+      throw new Error(`File changed while it was being read: expected ${size} bytes.`);
+    }
+    return buffer.subarray(0, size);
+  } finally {
+    await handle.close();
   }
-  return { path: pinnedPath, size: bytes, sha256: hash.digest("hex"), contentTypeHeader: null, dispose };
-}
-
-// The fetched temp file becomes the pinned file; its cleanup is the disposer.
-export async function pinFetchedFile(source: FetchedFileSource): Promise<PinnedFile> {
-  let sha256: string;
-  try {
-    sha256 = await sha256File(source.path);
-  } catch (err) {
-    await source.cleanup();
-    throw err;
-  }
-  return {
-    path: source.path,
-    size: source.size,
-    sha256,
-    contentTypeHeader: source.contentTypeHeader,
-    dispose: source.cleanup,
-  };
 }

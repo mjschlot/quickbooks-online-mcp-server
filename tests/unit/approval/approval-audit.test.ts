@@ -2,7 +2,12 @@ import { describe, it, expect, afterEach } from "@jest/globals";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { sanitizeErrorMessage, writeAuditEvent, type AuditEvent } from "../../../src/approval/approval-audit";
+import {
+  collectRedactableValues,
+  sanitizeErrorMessage,
+  writeAuditEvent,
+  type AuditEvent,
+} from "../../../src/approval/approval-audit";
 
 const SECRET_ENV = ["QUICKBOOKS_CLIENT_SECRET", "QUICKBOOKS_REFRESH_TOKEN", "QUICKBOOKS_CLIENT_ID"];
 
@@ -53,6 +58,29 @@ describe("writeAuditEvent", () => {
   });
 });
 
+describe("collectRedactableValues", () => {
+  it("collects distinct string leaves of at least 6 characters, longest first", () => {
+    const args = {
+      params: {
+        memo: "Website redesign",
+        currency: "USD",
+        id: "10428",
+        amount: 875000,
+        lines: [{ description: "Design", note: "Website redesign" }, null, true],
+      },
+    };
+    expect(collectRedactableValues(args)).toEqual(["Website redesign", "Design"]);
+  });
+
+  it("handles cyclic and non-object arguments", () => {
+    const cyclic: Record<string, unknown> = { note: "cyclic value" };
+    cyclic.self = cyclic;
+    expect(collectRedactableValues(cyclic)).toEqual(["cyclic value"]);
+    expect(collectRedactableValues("top-level")).toEqual(["top-level"]);
+    expect(collectRedactableValues(undefined)).toEqual([]);
+  });
+});
+
 describe("sanitizeErrorMessage", () => {
   afterEach(() => {
     for (const name of SECRET_ENV) delete process.env[name];
@@ -91,6 +119,23 @@ describe("sanitizeErrorMessage", () => {
       new Error("secret super-secret-value token refresh-token-value id short")
     );
     expect(sanitized).toBe("secret [REDACTED] token [REDACTED] id short");
+  });
+
+  it("redacts exact occurrences of the given values, longest first", () => {
+    const values = collectRedactableValues({ a: "redesign", b: "Website redesign" });
+    expect(sanitizeErrorMessage(new Error("Website redesign and redesign"), values)).toBe("[REDACTED] and [REDACTED]");
+  });
+
+  it("ignores values longer than the message", () => {
+    expect(sanitizeErrorMessage("short", ["short message that is longer"])).toBe("short");
+  });
+
+  it("redacts values before credential rules and truncation", () => {
+    expect(sanitizeErrorMessage("rejected access_token=value-123456 now", ["access_token=value-123456"])).toBe(
+      "rejected [REDACTED] now"
+    );
+    const sanitized = sanitizeErrorMessage(`${"x".repeat(489)} sensitive-note`, ["sensitive-note"]);
+    expect(sanitized).toBe(`${"x".repeat(489)} [REDACTED]`);
   });
 
   it("truncates to 500 characters after redaction", () => {

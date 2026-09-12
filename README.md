@@ -201,9 +201,9 @@ Each record has:
 | `realmId` | |
 | `outcome` | one of `requested`, `approved`, `declined`, `canceled`, `expired`, `unsupported-client`, `approval-error`, `replayed`, `hash-mismatch`, `executed`, `execution-failed` |
 | `entityId` | optional, best effort |
-| `error` | optional, sanitized — token-like values redacted, message truncated |
+| `error` | optional, sanitized — credentials and argument string values redacted, message truncated |
 
-Argument and payload values are never logged, only their hash. Credentials and OAuth tokens are never logged. `allow`-mode mutations are not audited by this log.
+The log records a payload hash, not the arguments. The `error` field holds sanitized error text with credentials and known argument string values (6 or more characters) redacted, but error text from QuickBooks can still contain data derived from the request. `allow`-mode mutations are not audited by this log.
 
 If the log is enabled and a write fails before the QuickBooks request is sent (`requested`/`approved` outcomes), the mutation is blocked. If the write fails after the QuickBooks request has already run, the server reports the failure on stderr and still returns the result — the mutation has already happened and cannot be undone by a failed log write.
 
@@ -222,7 +222,7 @@ Caveats:
 - Some clients apply their own tool-call timeout, which may be shorter than `QUICKBOOKS_APPROVAL_TIMEOUT_SECONDS`.
 - The server cannot verify that a human, rather than an automated hook or client policy, answered the prompt — the client is responsible for showing it to a person.
 
-For `create_attachable`, the server reads the `file_path` content or downloads the `file_url` before asking for approval, shows the content's size and SHA-256 in the prompt, and uploads exactly those pinned bytes. A `file_url` download therefore happens before approval, so a declined, denied, or cancelled call may already have downloaded the content (cancelling the tool call aborts a download in progress); no QuickBooks request is sent before approval. The pinned copy is deleted when the call finishes.
+For `create_attachable`, the server reads the `file_path` content or downloads the `file_url` before asking for approval, shows the content's size and SHA-256 in the prompt, and uploads exactly those pinned bytes. A `file_url` download therefore happens before approval, so a declined, denied, or cancelled call may already have downloaded the content (cancelling the tool call aborts a download in progress); no QuickBooks request is sent before approval. The pinned content (at most 100 MB) is held in memory until the call finishes; a downloaded file's temp copy is deleted as soon as it has been read.
 
 Approval covers the arguments sent to the tool, not other data read when the mutation runs: update handlers may merge the approved patch with the current QuickBooks record fetched at execution time (for example, its `SyncToken`), so the approval does not cover the full stored record.
 
