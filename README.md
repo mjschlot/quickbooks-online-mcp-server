@@ -32,7 +32,7 @@ This MCP server provides complete QuickBooks Online API integration for Claude C
 
 > Note: this is a local MCP server. It runs as a stdio subprocess on the developer's or partner's machine and authenticates to a QuickBooks Online company.
 
-> **Before you start:** This MCP server is easy to run once authenticated, but QuickBooks Online integration is gated by Intuit's OAuth app setup. You must register an app on the [Intuit Developer Portal](https://developer.intuit.com) and complete a one-time, browser-based OAuth handshake. **Sandbox** supports `http://localhost` redirect URIs; **production** requires a public HTTPS callback for the initial authorization. After that initial handshake, the server runs locally without further browser interaction (until the 100-day refresh window lapses). See [Authentication](#authentication) for full details.
+> **Before you start:** This MCP server is easy to run once authenticated, but QuickBooks Online integration is gated by Intuit's OAuth app setup. You must register an app on the [Intuit Developer Portal](https://developer.intuit.com) and complete a one-time, browser-based OAuth handshake. **Sandbox** supports `http://localhost` redirect URIs; **production** rejects them, so the initial production authorization uses Intuit's OAuth 2.0 Playground. After that initial handshake, the server runs locally without further browser interaction (until the 100-day refresh window lapses). See [Authentication](#authentication) for full details.
 
 ---
 
@@ -496,7 +496,7 @@ This server uses OAuth 2.0 to authenticate to a QuickBooks Online company. You'l
 | Mode | When to use | Redirect URI accepted | Setup difficulty |
 |------|-------------|------------------------|------------------|
 | **Sandbox** | Development, testing, demos | `http://localhost:8000/callback` works | Easy |
-| **Production** | Real company data | Localhost **rejected** — must be a public HTTPS URL | Harder (see below) |
+| **Production** | Real company data | Localhost **rejected** — use the OAuth 2.0 Playground redirect | Harder (see below) |
 
 If you only want to read your own company's data, you still need to set up an app — Intuit does not offer per-user API keys. There is no shortcut around the OAuth + app-creation flow.
 
@@ -511,12 +511,15 @@ If you only want to read your own company's data, you still need to set up an ap
 
 ### Production Setup
 
-The Intuit Developer Portal **rejects `http://localhost` redirect URIs in production mode** — every contributor hits this. Two known workarounds:
+The Intuit Developer Portal rejects `http://localhost` redirect URIs for production apps, so `npm run auth` works only in sandbox. With `QUICKBOOKS_ENVIRONMENT=production`, the server refuses to start the localhost OAuth flow. Get the production refresh token from Intuit's OAuth 2.0 Playground instead. The Playground has its own public HTTPS redirect URI, so you do not need to host a callback.
 
-1. **ngrok tunnel (most common):** run `ngrok http 8000`, then on your Intuit app go to **Settings → Redirect URIs** and add the generated `https://<id>.ngrok-free.app/callback` URL. Use that URL for the OAuth handshake, then revert to localhost afterwards.
-2. **Deploy a small public callback handler** (e.g., on a VPS or serverless function) that captures the auth code and hands it back to your local setup. More involved; only needed if you can't use ngrok.
+1. **Get production keys.** Open the app → **Keys & Credentials** → switch to **Production**. Intuit requires an End User License Agreement URL, a privacy policy URL, and an approved App Assessment and Compliance Questionnaire before it issues production keys.
+2. **Register the Playground redirect URI.** Add `https://developer.intuit.com/v2/OAuth2Playground/RedirectUrl` to the app's **Production** redirect URIs.
+3. **Get the tokens.** Open the OAuth Playground from the developer dashboard and select the **Production** version of the app. Select the Accounting scope, click **Get authorization code**, and connect to the company as a QuickBooks admin. Click **Get tokens** once.
+4. **Copy the values into `.env`.** Copy the **Refresh Token** (not the authorization code or the access token) into `QUICKBOOKS_REFRESH_TOKEN`, and the realm ID into `QUICKBOOKS_REALM_ID`. Use the Production client ID and secret, and set `QUICKBOOKS_ENVIRONMENT=production`. Do not refresh the token in the Playground afterwards; a refresh there can invalidate the copy in `.env`.
+5. **Verify the connection.** Run `npm run build`, then `npx @modelcontextprotocol/inspector node dist/index.js`. In the Inspector, connect the server and run `get_company_info`. It returns the company name. The server reads `.env` only at startup, so restart it after every `.env` change.
 
-After completing the production OAuth handshake, the refresh token is what matters — once it's in `.env`, you no longer need the public redirect URL for day-to-day use. Refresh tokens auto-rotate; the server persists the new token on each refresh.
+Refresh tokens rotate; the server persists each new token to `.env`. Use each refresh token in one installation only, because a rotation in one copy invalidates the others. If the token lapses (the 100-day refresh window) or Intuit revokes it, repeat steps 3–5.
 
 ### Once you have tokens
 
@@ -532,6 +535,7 @@ QUICKBOOKS_ENVIRONMENT=sandbox  # or 'production'
 
 - **`.env` loaded from the wrong directory.** The server resolves `.env` relative to the compiled module, not your shell's CWD. If you launch via Claude Desktop, this matters — make sure you're on current `main`.
 - **Redirect URI mismatch.** The URI you register in the Intuit portal must match **exactly** — protocol, host, port, path. `http://localhost:8000/callback` .
+- **"QuickBooks authorization is invalid or expired" with status code 400.** Intuit rejected the refresh token. Common causes: the authorization code or access token was copied instead of the refresh token, the token came from the Development app while `.env` has Production keys (or the reverse), or the token was refreshed elsewhere. Get a new token from the Playground. Status code 401 usually means the client ID or secret is wrong.
 
 ---
 
