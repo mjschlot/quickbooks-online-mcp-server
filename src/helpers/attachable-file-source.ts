@@ -1,5 +1,4 @@
 import { lookup } from "dns/promises";
-import { createWriteStream } from "fs";
 import { randomBytes } from "crypto";
 import { Readable } from "stream";
 import { pipeline } from "stream/promises";
@@ -246,10 +245,35 @@ export interface FetchedFileSource extends LocalFileSource {
   cleanup: () => Promise<void>;
 }
 
+// Aborts when the timeout elapses or `external` aborts. AbortSignal.any is not
+// used because it needs Node 20.3 and the MCP SDK still supports Node 18.
+function downloadSignal(timeoutMs: number, external: AbortSignal | undefined): { signal: AbortSignal; release: () => void } {
+  const timeout = AbortSignal.timeout(timeoutMs);
+  if (!external) return { signal: timeout, release: () => undefined };
+  const controller = new AbortController();
+  const onTimeout = () => controller.abort(timeout.reason);
+  const onExternal = () => controller.abort(external.reason);
+  if (external.aborted) onExternal();
+  timeout.addEventListener("abort", onTimeout, { once: true });
+  external.addEventListener("abort", onExternal, { once: true });
+  return {
+    signal: controller.signal,
+    release: () => {
+      timeout.removeEventListener("abort", onTimeout);
+      external.removeEventListener("abort", onExternal);
+    },
+  };
+}
+
 // Fetch an HTTPS URL and spool the body to a temp file, enforcing the size
 // cap while streaming (memory stays flat regardless of file size). Redirects
-// are followed manually (max 3) so every hop passes the SSRF checks.
-export async function fetchUrlToTempFile(fileUrl: string, maxBytes: number): Promise<FetchedFileSource> {
+// are followed manually (max 3) so every hop passes the SSRF checks. Aborting
+// `externalSignal` stops the download and removes any partial temp file.
+export async function fetchUrlToTempFile(
+  fileUrl: string,
+  maxBytes: number,
+  externalSignal?: AbortSignal
+): Promise<FetchedFileSource> {
   let current: URL;
   try {
     current = new URL(fileUrl);
@@ -257,7 +281,15 @@ export async function fetchUrlToTempFile(fileUrl: string, maxBytes: number): Pro
     throw new Error(`file_url is not a valid URL: ${fileUrl}`);
   }
 
-  const signal = AbortSignal.timeout(urlFetchTimeoutMs());
+  const { signal, release } = downloadSignal(urlFetchTimeoutMs(), externalSignal);
+  try {
+    return await spoolToTempFile(current, maxBytes, signal);
+  } finally {
+    release();
+  }
+}
+
+async function spoolToTempFile(current: URL, maxBytes: number, signal: AbortSignal): Promise<FetchedFileSource> {
   let response: Response | null = null;
   for (let hop = 0; hop <= 3; hop++) {
     await assertUrlAllowed(current);
@@ -295,6 +327,9 @@ export async function fetchUrlToTempFile(fileUrl: string, maxBytes: number): Pro
     os.tmpdir(),
     `qbo-attach-${process.pid}-${randomBytes(6).toString("hex")}.tmp`
   );
+  // Private, and "wx" never opens a path that already exists; opened before
+  // cleanup is armed so a colliding file is never deleted.
+  const handle = await fs.open(tempPath, "wx", 0o600);
   const cleanup = async () => {
     await fs.unlink(tempPath).catch(swallow);
   };
@@ -312,7 +347,11 @@ export async function fetchUrlToTempFile(fileUrl: string, maxBytes: number): Pro
   });
 
   try {
-    await pipeline(Readable.fromWeb(response.body as any), capEnforcer, createWriteStream(tempPath));
+    await pipeline(
+      Readable.fromWeb(response.body as any),
+      capEnforcer,
+      handle.createWriteStream()
+    );
   } catch (err) {
     await cleanup();
     throw err;
@@ -329,4 +368,28 @@ export async function fetchUrlToTempFile(fileUrl: string, maxBytes: number): Pro
     contentTypeHeader: response.headers.get("content-type"),
     cleanup,
   };
+}
+
+// ── pinned content ────────────────────────────────────────────────────────
+
+// Reads exactly `size` bytes into a new Buffer. A file that is shorter or
+// longer than `size` changed after it was checked, so the read fails rather
+// than snapshot content that bypassed the size cap or was cut short.
+export async function readFileSnapshot(filePath: string, size: number): Promise<Buffer> {
+  const handle = await fs.open(filePath, "r");
+  try {
+    const buffer = Buffer.allocUnsafe(size + 1);
+    let bytes = 0;
+    while (bytes <= size) {
+      const { bytesRead } = await handle.read(buffer, bytes, size + 1 - bytes, bytes);
+      if (bytesRead === 0) break;
+      bytes += bytesRead;
+    }
+    if (bytes !== size) {
+      throw new Error(`File changed while it was being read: expected ${size} bytes.`);
+    }
+    return buffer.subarray(0, size);
+  } finally {
+    await handle.close();
+  }
 }

@@ -1,4 +1,5 @@
 import https from "https";
+import { createHash } from "crypto";
 import { createReadStream } from "fs";
 import { QuickbooksClient } from "../clients/quickbooks-client.js";
 import { ToolResponse } from "../types/tool-response.js";
@@ -6,6 +7,7 @@ import { formatError } from "../helpers/format-error.js";
 import {
   fetchUrlToTempFile,
   inferContentType,
+  readFileSnapshot,
   resolveLocalFile,
 } from "../helpers/attachable-file-source.js";
 
@@ -69,8 +71,9 @@ export interface CreateAttachableInput {
 }
 
 // The file part of the multipart body: either bytes already in memory
-// (base64 path) or a local file streamed from disk (file_path / file_url,
-// the latter spooled to a temp file by the fetch helper).
+// (base64 path or pinned content) or a local file streamed from disk
+// (unpinned file_path / file_url, the latter spooled to a temp file by the
+// fetch helper).
 type UploadFileSource = { buffer: Buffer } | { path: string; size: number };
 
 function sanitizeFilename(name: string): string {
@@ -210,8 +213,64 @@ async function uploadAttachableFile(
   });
 }
 
+/**
+ * File content resolved, validated, and read into memory before approval.
+ * The buffer is owned by the pending call and never written, so the uploaded
+ * bytes are the ones hashed into the approval.
+ */
+export interface PinnedAttachableSource {
+  buffer: Buffer;
+  contentTypeHeader: string | null;
+}
+
+export interface PinnedAttachable {
+  facts: Record<string, string | number>;
+  source: PinnedAttachableSource;
+}
+
+/**
+ * Resolves file_path or file_url with the same checks as an unpinned upload
+ * and snapshots the bytes in memory (at most MAX_UPLOAD_BYTES): a local file
+ * is read once, and a URL is downloaded (a GET to that URL, no QuickBooks
+ * request) to a temp file that is read and deleted before this returns.
+ * Returns null when there is no single file reference to pin (base64 bytes are
+ * already part of the arguments; conflicting or absent references are handled
+ * by createQuickbooksAttachable).
+ */
+export async function pinAttachableSource(
+  data: CreateAttachableInput,
+  signal: AbortSignal
+): Promise<PinnedAttachable | null> {
+  if (data.file_url && data.file_path) return null;
+  if (data.file_url) {
+    const fetched = await fetchUrlToTempFile(data.file_url, MAX_UPLOAD_BYTES, signal);
+    let buffer: Buffer;
+    try {
+      buffer = await readFileSnapshot(fetched.path, fetched.size);
+    } finally {
+      await fetched.cleanup();
+    }
+    return pinnedAttachable("file_url", buffer, fetched.contentTypeHeader);
+  }
+  if (!data.file_path) return null;
+  const local = await resolveLocalFile(data.file_path, MAX_UPLOAD_BYTES);
+  return pinnedAttachable("file_path", await readFileSnapshot(local.path, local.size), null);
+}
+
+function pinnedAttachable(source: "file_path" | "file_url", buffer: Buffer, contentTypeHeader: string | null): PinnedAttachable {
+  const facts: Record<string, string | number> = {
+    source,
+    bytes: buffer.length,
+    sha256: createHash("sha256").update(buffer).digest("hex"),
+  };
+  if (contentTypeHeader !== null) facts.content_type_header = contentTypeHeader;
+  return { facts, source: { buffer, contentTypeHeader } };
+}
+
+/** With `pinned`, uploads that snapshot instead of reading file_path or downloading file_url. */
 export async function createQuickbooksAttachable(
-  data: CreateAttachableInput
+  data: CreateAttachableInput,
+  pinned?: PinnedAttachableSource
 ): Promise<ToolResponse<any>> {
   try {
     // Build payload — same shape whether or not we're uploading binary content.
@@ -250,7 +309,10 @@ export async function createQuickbooksAttachable(
       let fetchedContentType: string | null = null;
       let cleanup: (() => Promise<void>) | null = null;
 
-      if (data.file_url) {
+      if (pinned) {
+        fileSource = { buffer: pinned.buffer };
+        fetchedContentType = pinned.contentTypeHeader;
+      } else if (data.file_url) {
         const fetched = await fetchUrlToTempFile(data.file_url, MAX_UPLOAD_BYTES);
         fileSource = { path: fetched.path, size: fetched.size };
         fetchedContentType = fetched.contentTypeHeader;

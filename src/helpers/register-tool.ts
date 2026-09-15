@@ -1,6 +1,9 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { ToolDefinition } from "../types/tool-definition.js";
 import { z } from "zod";
+import { loadApprovalConfig } from "../approval/approval-config.js";
+import { createApprovalHandler } from "../approval/approval-handler.js";
+import { MODE_ENV, normalizeModeValue } from "../approval/policy-env.js";
 
 /**
  * Defines CRUD categories for tools
@@ -14,8 +17,15 @@ export const CRUD_CATEGORY = {
 
 export type CrudCategory = typeof CRUD_CATEGORY[keyof typeof CRUD_CATEGORY];
 
-/** 
+export type MutationCategory = Exclude<CrudCategory, typeof CRUD_CATEGORY.READ>;
+
+export type MutationMode = "allow" | "approval" | "disabled";
+
+const MUTATION_MODES: readonly MutationMode[] = ["allow", "approval", "disabled"];
+
+/**
  * Maps each CRUD category to its corresponding environment variable for disabling tools.
+ * Consulted only when the category's MODE_ENV variable is unset.
  */
 export const DISABLE_ENV = {
   [CRUD_CATEGORY.WRITE]:  "QUICKBOOKS_DISABLE_WRITE",
@@ -23,11 +33,10 @@ export const DISABLE_ENV = {
   [CRUD_CATEGORY.DELETE]: "QUICKBOOKS_DISABLE_DELETE",
 } as const;
 
-/** 
- * Maps every non-READ verb prefix to its category. Handles both underscore
+/**
+ * Maps every verb prefix to its category. Handles both underscore
  * and legacy hyphen separator variants (e.g. create-bill, update-vendor).
- * Insertion order is preserved in V8; all prefixes are distinct so order
- * does not affect correctness.
+ * All prefixes are distinct so order does not affect correctness.
  */
 export const PREFIX_CATEGORY_MAP: Record<string, CrudCategory> = {
   "create_": CRUD_CATEGORY.WRITE,
@@ -36,43 +45,71 @@ export const PREFIX_CATEGORY_MAP: Record<string, CrudCategory> = {
   "update-": CRUD_CATEGORY.UPDATE,
   "delete_": CRUD_CATEGORY.DELETE,
   "delete-": CRUD_CATEGORY.DELETE,
+  "get_":    CRUD_CATEGORY.READ,
+  "get-":    CRUD_CATEGORY.READ,
+  "search_": CRUD_CATEGORY.READ,
+  "search-": CRUD_CATEGORY.READ,
+  "read_":   CRUD_CATEGORY.READ,
+  "read-":   CRUD_CATEGORY.READ,
 };
 
-/** 
+/**
  * Determines the CRUD category of a tool based on its name prefix.
- * Defaults to READ if no prefix matches.
+ * Throws for an unrecognized prefix so a new mutating tool cannot bypass
+ * mutation policy by being treated as READ.
  */
 export function getCrudCategory(toolName: string): CrudCategory {
   for (const [prefix, category] of Object.entries(PREFIX_CATEGORY_MAP)) {
     if (toolName.startsWith(prefix)) return category;
   }
-  return CRUD_CATEGORY.READ;
+  throw new Error(
+    `Tool "${toolName}" has no recognized verb prefix (${Object.keys(PREFIX_CATEGORY_MAP).join(", ")}); cannot classify it for mutation policy.`
+  );
 }
 
-/** 
- * Checks if a tool is disabled based on its CRUD category and corresponding environment variable.
- * READ tools are never disabled.
+/**
+ * A set, valid MODE_ENV value wins; an invalid one throws. When unset, the
+ * legacy DISABLE_ENV flag disables the category only for the exact string "true".
  */
-export function isToolDisabled(toolName: string): boolean {
-  const category = getCrudCategory(toolName);
-  if (category === CRUD_CATEGORY.READ) return false;
-  return process.env[DISABLE_ENV[category]] === "true";
+export function resolveMutationMode(
+  category: MutationCategory,
+  env: NodeJS.ProcessEnv = process.env
+): MutationMode {
+  const variable = MODE_ENV[category];
+  const value = normalizeModeValue(env[variable]);
+  if (value) {
+    const mode = MUTATION_MODES.find((candidate) => candidate === value);
+    if (mode === undefined) {
+      throw new Error(
+        `Invalid ${variable}=${JSON.stringify(env[variable])}; expected one of: ${MUTATION_MODES.join(", ")}.`
+      );
+    }
+    return mode;
+  }
+  return env[DISABLE_ENV[category]] === "true" ? "disabled" : "allow";
 }
 
-/** 
- * Registers a tool with the MCP server if it is not disabled.
- * Tools are categorized by their name prefix (e.g. create_, update_, delete_).
- * The corresponding environment variable (e.g. QUICKBOOKS_DISABLE_WRITE) determines if the tool is registered.
+/**
+ * Registers a tool according to its category's mutation mode: READ tools and
+ * "allow" mutations register the original handler, "approval" mutations
+ * register a handler gated on human approval, and "disabled" mutations are
+ * not registered. Approval settings are validated on every call so a
+ * misconfiguration fails at startup regardless of the modes in effect.
  */
 export function RegisterTool<T extends z.ZodType<any, any>>(
   server: McpServer,
   toolDefinition: ToolDefinition<T>
 ) {
-  if (isToolDisabled(toolDefinition.name)) return;
-  server.tool(
-    toolDefinition.name,
-    toolDefinition.description,
-    { params: toolDefinition.schema },
-    toolDefinition.handler
-  );
+  const definition: ToolDefinition<z.ZodType<any, any>> = toolDefinition;
+  const approvalConfig = loadApprovalConfig(process.env);
+  const category = getCrudCategory(definition.name);
+  let handler = definition.handler;
+  if (category !== CRUD_CATEGORY.READ) {
+    const mode = resolveMutationMode(category);
+    if (mode === "disabled") return;
+    if (mode === "approval") {
+      handler = createApprovalHandler(server, definition, category, approvalConfig);
+    }
+  }
+  server.tool(definition.name, definition.description, { params: definition.schema }, handler);
 }

@@ -3,6 +3,7 @@ import fs from 'fs/promises';
 import os from 'os';
 import path from 'path';
 import { Writable } from 'stream';
+import * as realCrypto from 'crypto';
 import { mockQuickbooksClient, mockQuickbooksClientClass } from '../../mocks/quickbooks.mock';
 
 // Mock DNS so hostname URLs resolve to a public address (or a private one,
@@ -11,6 +12,10 @@ const mockLookup = jest.fn();
 jest.unstable_mockModule('dns/promises', () => ({
   lookup: mockLookup,
 }));
+
+// randomBytes is mocked only so a test can force a temp-path collision.
+const mockRandomBytes = jest.fn((size: number) => realCrypto.randomBytes(size));
+jest.unstable_mockModule('crypto', () => ({ ...realCrypto, default: realCrypto, randomBytes: mockRandomBytes }));
 
 jest.unstable_mockModule('../../../src/clients/quickbooks-client', () => ({
   quickbooksClient: mockQuickbooksClient,
@@ -66,9 +71,22 @@ const mockFetch = jest.fn();
 beforeEach(() => {
   mockLookup.mockReset();
   mockFetch.mockReset();
+  mockRandomBytes.mockReset();
+  mockRandomBytes.mockImplementation((size: number) => realCrypto.randomBytes(size));
   (mockLookup as any).mockResolvedValue([{ address: '93.184.216.34', family: 4 }]);
   globalThis.fetch = mockFetch as any;
 });
+
+async function downloadTempFiles(): Promise<string[]> {
+  return (await fs.readdir(os.tmpdir())).filter((name) => name.startsWith(`qbo-attach-${process.pid}-`));
+}
+
+// Settles only when the request signal aborts, like a real fetch would.
+function fetchUntilAborted(_url: unknown, init: RequestInit): Promise<Response> {
+  return new Promise((_resolve, reject) => {
+    init.signal?.addEventListener('abort', () => reject(init.signal?.reason), { once: true });
+  });
+}
 
 afterEach(() => {
   globalThis.fetch = realFetch;
@@ -89,6 +107,9 @@ describe('fetchUrlToTempFile', () => {
       expect(fetched.contentTypeHeader).toBe('application/pdf');
       const onDisk = await fs.readFile(fetched.path);
       expect(onDisk.equals(bytes)).toBe(true);
+      if (process.platform !== 'win32') {
+        expect((await fs.stat(fetched.path)).mode & 0o777).toBe(0o600);
+      }
     } finally {
       await fetched.cleanup();
     }
@@ -211,6 +232,69 @@ describe('fetchUrlToTempFile', () => {
     await expect(fetchUrlToTempFile('https://example.com/doc.pdf', MAX)).rejects.toThrow(
       /empty body/
     );
+  });
+
+  it('does not overwrite or remove a file already at the temp path', async () => {
+    const collidingPath = path.join(os.tmpdir(), `qbo-attach-${process.pid}-aaaaaaaaaaaa.tmp`);
+    await fs.writeFile(collidingPath, 'existing');
+    try {
+      mockRandomBytes.mockReturnValueOnce(Buffer.from('aaaaaaaaaaaa', 'hex'));
+      (mockFetch as any).mockResolvedValue(okResponse(Buffer.from('%PDF-1.7 new')));
+      await expect(fetchUrlToTempFile('https://example.com/doc.pdf', MAX)).rejects.toMatchObject({ code: 'EEXIST' });
+      expect(await fs.readFile(collidingPath, 'utf8')).toBe('existing');
+    } finally {
+      await fs.rm(collidingPath, { force: true });
+    }
+  });
+
+  it('stops the download and removes the partial temp file when the external signal aborts', async () => {
+    const controller = new AbortController();
+    const before = await downloadTempFiles();
+    let partialFiles: string[] = [];
+    (mockFetch as any).mockImplementation(async (_url: unknown, init: RequestInit) => {
+      const body = new ReadableStream<Uint8Array>({
+        start(stream) {
+          init.signal?.addEventListener('abort', () => stream.error(init.signal?.reason), { once: true });
+          stream.enqueue(new Uint8Array(Buffer.from('%PDF-1.7 partial')));
+        },
+        async pull() {
+          partialFiles = await downloadTempFiles();
+          controller.abort();
+          return new Promise<void>(() => undefined);
+        },
+      });
+      return new Response(body, { status: 200 });
+    });
+
+    await expect(fetchUrlToTempFile('https://example.com/doc.pdf', MAX, controller.signal)).rejects.toMatchObject({
+      name: 'AbortError',
+    });
+    expect(partialFiles.length).toBe(before.length + 1);
+    expect(await downloadTempFiles()).toEqual(before);
+  });
+
+  it('does not download when the external signal is already aborted', async () => {
+    const controller = new AbortController();
+    controller.abort();
+    (mockFetch as any).mockImplementation(async (_url: unknown, init: RequestInit) => {
+      init.signal?.throwIfAborted();
+      return okResponse(Buffer.from('never'));
+    });
+    await expect(fetchUrlToTempFile('https://example.com/doc.pdf', MAX, controller.signal)).rejects.toMatchObject({
+      name: 'AbortError',
+    });
+  });
+
+  it('still applies the timeout when an external signal is given', async () => {
+    process.env.QUICKBOOKS_ATTACHABLE_URL_TIMEOUT_MS = '10';
+    try {
+      (mockFetch as any).mockImplementation(fetchUntilAborted);
+      await expect(
+        fetchUrlToTempFile('https://example.com/doc.pdf', MAX, new AbortController().signal)
+      ).rejects.toMatchObject({ name: 'TimeoutError' });
+    } finally {
+      delete process.env.QUICKBOOKS_ATTACHABLE_URL_TIMEOUT_MS;
+    }
   });
 
   it('honors QUICKBOOKS_ATTACHABLE_URL_TIMEOUT_MS', async () => {

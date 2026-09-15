@@ -32,7 +32,7 @@ This MCP server provides complete QuickBooks Online API integration for Claude C
 
 > Note: this is a local MCP server. It runs as a stdio subprocess on the developer's or partner's machine and authenticates to a QuickBooks Online company.
 
-> **Before you start:** This MCP server is easy to run once authenticated, but QuickBooks Online integration is gated by Intuit's OAuth app setup. You must register an app on the [Intuit Developer Portal](https://developer.intuit.com) and complete a one-time, browser-based OAuth handshake. **Sandbox** supports `http://localhost` redirect URIs; **production** requires a public HTTPS callback for the initial authorization. After that initial handshake, the server runs locally without further browser interaction (until the 100-day refresh window lapses). See [Authentication](#authentication) for full details.
+> **Before you start:** This MCP server is easy to run once authenticated, but QuickBooks Online integration is gated by Intuit's OAuth app setup. You must register an app on the [Intuit Developer Portal](https://developer.intuit.com) and complete a one-time, browser-based OAuth handshake. **Sandbox** supports `http://localhost` redirect URIs; **production** rejects them, so the initial production authorization uses Intuit's OAuth 2.0 Playground. After that initial handshake, the server runs locally without further browser interaction (until the 100-day refresh window lapses). See [Authentication](#authentication) for full details.
 
 ---
 
@@ -67,11 +67,14 @@ QUICKBOOKS_ENVIRONMENT=sandbox
 QUICKBOOKS_REFRESH_TOKEN=your_refresh_token
 QUICKBOOKS_REALM_ID=your_realm_id
 
-# Optional: restrict which tool categories are registered (default: all enabled)
-# QUICKBOOKS_DISABLE_WRITE=true    # suppress create_* tools
-# QUICKBOOKS_DISABLE_UPDATE=true   # suppress update_* tools
-# QUICKBOOKS_DISABLE_DELETE=true   # suppress delete_* tools
+# Optional: control which tool categories are registered, and whether they
+# require human approval (default: allow, i.e. all tools registered, no approval)
+# QUICKBOOKS_WRITE_MODE=approval    # allow | approval | disabled — governs create_* tools
+# QUICKBOOKS_UPDATE_MODE=approval   # allow | approval | disabled — governs update_* tools
+# QUICKBOOKS_DELETE_MODE=approval   # allow | approval | disabled — governs delete_* tools
 ```
+
+See [Mutation Modes and Approval](#mutation-modes-and-approval) below for the full reference, including the legacy `QUICKBOOKS_DISABLE_*` flags, which are still supported.
 
 `.env` is gitignored so your real credentials stay local.
 
@@ -93,16 +96,137 @@ Add to your Claude Code MCP configuration:
         "QUICKBOOKS_REFRESH_TOKEN": "your_refresh_token",
         "QUICKBOOKS_REALM_ID": "your_realm_id",
         "QUICKBOOKS_ENVIRONMENT": "sandbox",
-        "QUICKBOOKS_DISABLE_WRITE": "false",
-        "QUICKBOOKS_DISABLE_UPDATE": "false",
-        "QUICKBOOKS_DISABLE_DELETE": "false"
+        "QUICKBOOKS_WRITE_MODE": "allow",
+        "QUICKBOOKS_UPDATE_MODE": "approval",
+        "QUICKBOOKS_DELETE_MODE": "approval"
       }
     }
   }
 }
 ```
 
-Set any of the `DISABLE_*` flags to `"true"` to prevent that category of tools from being registered. Read tools (`get_*`, `search_*`) are always available.
+Each `*_MODE` variable accepts `allow` (register the tool, no approval needed — default), `approval` (register the tool, but require human approval on every call), or `disabled` (do not register the tool). The legacy `QUICKBOOKS_DISABLE_WRITE` / `QUICKBOOKS_DISABLE_UPDATE` / `QUICKBOOKS_DISABLE_DELETE` flags still work and are used when the corresponding `*_MODE` variable is unset. Read tools (`get_*`, `search_*`, `read_*`) are always available and are never gated. See [Mutation Modes and Approval](#mutation-modes-and-approval).
+
+---
+
+## Mutation Modes and Approval
+
+Three environment variables independently control whether `create_*`, `update_*`, and `delete_*` tools are registered, and whether their calls require human approval before reaching QuickBooks:
+
+| Variable | Governs |
+|----------|---------|
+| `QUICKBOOKS_WRITE_MODE` | `create_*` tools (named `WRITE` to match the legacy `QUICKBOOKS_DISABLE_WRITE`) |
+| `QUICKBOOKS_UPDATE_MODE` | `update_*` tools |
+| `QUICKBOOKS_DELETE_MODE` | `delete_*` tools |
+
+Each accepts one of three values (case-insensitive, surrounding whitespace trimmed; unset counts as empty):
+
+| Value | Tool registered? | Approval required? |
+|-------|:---:|:---:|
+| `allow` (default) | Yes | No |
+| `approval` | Yes | Yes, on every call |
+| `disabled` | No | N/A |
+
+Read tools (`get_*`, `search_*`, `read_*`) are never gated by these variables.
+
+Set these in `.env` or in the MCP host's `env` block. Unlike `QUICKBOOKS_TOKEN_STORE_PATH`, they are read after `.env` loads, so either location works. Set each variable in one location only. If the host environment sets a mode or `QUICKBOOKS_APPROVAL_*` variable and the token store file sets it to a different value, the server refuses to start.
+
+### Precedence
+
+1. A `*_MODE` variable set to a valid value wins.
+2. Otherwise, the legacy flag is checked: the exact string `"true"` in `QUICKBOOKS_DISABLE_WRITE` / `QUICKBOOKS_DISABLE_UPDATE` / `QUICKBOOKS_DISABLE_DELETE` maps to `disabled`.
+3. Otherwise, the mode defaults to `allow`.
+
+An invalid `*_MODE` value (anything other than `allow`, `approval`, or `disabled`) makes the server refuse to start, with an error naming the offending variable.
+
+### Example configurations
+
+Require approval for every mutation:
+
+```env
+QUICKBOOKS_WRITE_MODE=approval
+QUICKBOOKS_UPDATE_MODE=approval
+QUICKBOOKS_DELETE_MODE=approval
+```
+
+Allow creation, approve updates and deletes:
+
+```env
+QUICKBOOKS_WRITE_MODE=allow
+QUICKBOOKS_UPDATE_MODE=approval
+QUICKBOOKS_DELETE_MODE=approval
+```
+
+Read-only (no mutation tools registered):
+
+```env
+QUICKBOOKS_WRITE_MODE=disabled
+QUICKBOOKS_UPDATE_MODE=disabled
+QUICKBOOKS_DELETE_MODE=disabled
+```
+
+### How approval works
+
+For a tool in `approval` mode, after the MCP SDK validates the call's arguments against the tool's schema, the server:
+
+1. Checks that the connected client advertised the MCP `elicitation` (form) capability. If not, the call fails closed with an error, and no request is sent to QuickBooks.
+2. Gets the realm ID from the QuickBooks client — the company the mutation will actually target. This may authenticate first (a token refresh, or in sandbox the interactive OAuth flow) before the prompt appears.
+3. For `create_attachable`, pins the file content (see below).
+4. Canonicalizes the exact arguments and computes a SHA-256 hash over the tool name, mutation category, realm ID, arguments, and any pinned file facts, then issues a single-use approval ID that expires after `QUICKBOOKS_APPROVAL_TIMEOUT_SECONDS`.
+5. Sends an `elicitation/create` form request showing the operation type (CREATE/UPDATE/DELETE, with a conspicuous warning for DELETE), the tool name, realm ID, pinned file content, identifiers, amount-like fields, every field of the exact payload, the approval ID, the payload hash, and the expiry. The user must set `approve` to true and accept the form.
+6. On approval, re-checks the client's realm ID (blocking the call if the company changed), consumes the single-use approval, and runs the handler with exactly the approved arguments.
+
+Decline, cancel, accepting without `approve=true`, timeout, a cancelled tool call, client/elicitation errors, an expired, replayed, or mismatched approval, a QuickBooks company change after approval, a file that cannot be pinned, and internal errors all block the call — none of them send a request to QuickBooks. Each approval covers exactly one call; retrying or changing arguments requires a new approval. Approval state is kept in memory only: it does not survive a server restart, and approvals are never persisted or reused across restarts.
+
+`QUICKBOOKS_APPROVAL_TIMEOUT_SECONDS` (integer, 1–3600, default `300`) sets how long the user has to respond before the approval expires. An invalid value makes the server refuse to start.
+
+### Audit log
+
+```env
+QUICKBOOKS_APPROVAL_AUDIT_LOG=true
+QUICKBOOKS_APPROVAL_AUDIT_LOG_PATH=/absolute/path/to/audit.jsonl
+```
+
+When enabled, the server writes one JSON object per line for each approval-mode call. `QUICKBOOKS_APPROVAL_AUDIT_LOG_PATH` must be an absolute path; the file is created with mode `0600`. Enabling the log without a path, with a relative path, or setting a path without also setting `QUICKBOOKS_APPROVAL_AUDIT_LOG=true` makes the server refuse to start.
+
+Each record has:
+
+| Field | Notes |
+|-------|-------|
+| `timestamp` | |
+| `approvalId` | |
+| `toolName` | |
+| `category` | |
+| `payloadHash` | |
+| `realmId` | |
+| `outcome` | one of `requested`, `approved`, `declined`, `canceled`, `expired`, `unsupported-client`, `approval-error`, `replayed`, `hash-mismatch`, `executed`, `execution-failed` |
+| `entityId` | optional, best effort |
+| `error` | optional, sanitized — credentials and argument string values redacted, message truncated |
+
+The log records a payload hash, not the arguments. The `error` field holds sanitized error text with credentials and known argument string values (6 or more characters) redacted, but error text from QuickBooks can still contain data derived from the request. `allow`-mode mutations are not audited by this log.
+
+If the log is enabled and a write fails before the QuickBooks request is sent (`requested`/`approved` outcomes), the mutation is blocked. If the write fails after the QuickBooks request has already run, the server reports the failure on stderr and still returns the result — the mutation has already happened and cannot be undone by a failed log write.
+
+### Client compatibility
+
+Support for MCP form elicitation varies by client and version; verify against the client you actually use. As researched in September 2026:
+
+- **Supports it:** Claude Code (interactive sessions), Cursor, OpenAI Codex CLI (custom MCP servers, since April 2026), MCP Inspector.
+- **Does not support it:** Claude Desktop, Zed.
+- **Unverified:** VS Code / GitHub Copilot, Windsurf.
+
+Caveats:
+
+- Claude Code headless/print mode (`-p`) auto-cancels elicitations unless a hook answers them — approval-mode mutations are blocked in that mode, and a hook that auto-approves defeats the safeguard.
+- Cursor has reported issues routing an elicitation to the correct window when multiple windows are open.
+- Some clients apply their own tool-call timeout, which may be shorter than `QUICKBOOKS_APPROVAL_TIMEOUT_SECONDS`.
+- The server cannot verify that a human, rather than an automated hook or client policy, answered the prompt — the client is responsible for showing it to a person.
+
+For `create_attachable`, the server reads the `file_path` content or downloads the `file_url` before asking for approval, shows the content's size and SHA-256 in the prompt, and uploads exactly those pinned bytes. A `file_url` download therefore happens before approval, so a declined, denied, or cancelled call may already have downloaded the content (cancelling the tool call aborts a download in progress); no QuickBooks request is sent before approval. The pinned content (at most 100 MB) is held in memory until the call finishes; a downloaded file's temp copy is deleted as soon as it has been read.
+
+Approval covers the arguments sent to the tool, not other data read when the mutation runs: update handlers may merge the approved patch with the current QuickBooks record fetched at execution time (for example, its `SyncToken`), so the approval does not cover the full stored record.
+
+Approval mode is a server-enforced safeguard. It is not a substitute for QuickBooks user permissions, OAuth credential security, backups, review processes, or accounting controls. The LLM is not the security boundary; approval is enforced in server code.
 
 ---
 
@@ -372,7 +496,7 @@ This server uses OAuth 2.0 to authenticate to a QuickBooks Online company. You'l
 | Mode | When to use | Redirect URI accepted | Setup difficulty |
 |------|-------------|------------------------|------------------|
 | **Sandbox** | Development, testing, demos | `http://localhost:8000/callback` works | Easy |
-| **Production** | Real company data | Localhost **rejected** — must be a public HTTPS URL | Harder (see below) |
+| **Production** | Real company data | Localhost **rejected** — use the OAuth 2.0 Playground redirect | Harder (see below) |
 
 If you only want to read your own company's data, you still need to set up an app — Intuit does not offer per-user API keys. There is no shortcut around the OAuth + app-creation flow.
 
@@ -387,12 +511,15 @@ If you only want to read your own company's data, you still need to set up an ap
 
 ### Production Setup
 
-The Intuit Developer Portal **rejects `http://localhost` redirect URIs in production mode** — every contributor hits this. Two known workarounds:
+The Intuit Developer Portal rejects `http://localhost` redirect URIs for production apps, so `npm run auth` works only in sandbox. With `QUICKBOOKS_ENVIRONMENT=production`, the server refuses to start the localhost OAuth flow. Get the production refresh token from Intuit's OAuth 2.0 Playground instead. The Playground has its own public HTTPS redirect URI, so you do not need to host a callback.
 
-1. **ngrok tunnel (most common):** run `ngrok http 8000`, then on your Intuit app go to **Settings → Redirect URIs** and add the generated `https://<id>.ngrok-free.app/callback` URL. Use that URL for the OAuth handshake, then revert to localhost afterwards.
-2. **Deploy a small public callback handler** (e.g., on a VPS or serverless function) that captures the auth code and hands it back to your local setup. More involved; only needed if you can't use ngrok.
+1. **Get production keys.** Open the app → **Keys & Credentials** → switch to **Production**. Intuit requires an End User License Agreement URL, a privacy policy URL, and an approved App Assessment and Compliance Questionnaire before it issues production keys.
+2. **Register the Playground redirect URI.** Add `https://developer.intuit.com/v2/OAuth2Playground/RedirectUrl` to the app's **Production** redirect URIs.
+3. **Get the tokens.** Open the OAuth Playground from the developer dashboard and select the **Production** version of the app. Select the Accounting scope, click **Get authorization code**, and connect to the company as a QuickBooks admin. Click **Get tokens** once.
+4. **Copy the values into `.env`.** Copy the **Refresh Token** (not the authorization code or the access token) into `QUICKBOOKS_REFRESH_TOKEN`, and the realm ID into `QUICKBOOKS_REALM_ID`. Use the Production client ID and secret, and set `QUICKBOOKS_ENVIRONMENT=production`. Do not refresh the token in the Playground afterwards; a refresh there can invalidate the copy in `.env`.
+5. **Verify the connection.** Run `npm run build`, then `npx @modelcontextprotocol/inspector node dist/index.js`. In the Inspector, connect the server and run `get_company_info`. It returns the company name. The server reads `.env` only at startup, so restart it after every `.env` change.
 
-After completing the production OAuth handshake, the refresh token is what matters — once it's in `.env`, you no longer need the public redirect URL for day-to-day use. Refresh tokens auto-rotate; the server persists the new token on each refresh.
+Refresh tokens rotate; the server persists each new token to `.env`. Use each refresh token in one installation only, because a rotation in one copy invalidates the others. If the token lapses (the 100-day refresh window) or Intuit revokes it, repeat steps 3–5.
 
 ### Once you have tokens
 
@@ -408,6 +535,7 @@ QUICKBOOKS_ENVIRONMENT=sandbox  # or 'production'
 
 - **`.env` loaded from the wrong directory.** The server resolves `.env` relative to the compiled module, not your shell's CWD. If you launch via Claude Desktop, this matters — make sure you're on current `main`.
 - **Redirect URI mismatch.** The URI you register in the Intuit portal must match **exactly** — protocol, host, port, path. `http://localhost:8000/callback` .
+- **"QuickBooks authorization is invalid or expired" with status code 400.** Intuit rejected the refresh token. Common causes: the authorization code or access token was copied instead of the refresh token, the token came from the Development app while `.env` has Production keys (or the reverse), or the token was refreshed elsewhere. Get a new token from the Playground. Status code 401 usually means the client ID or secret is wrong.
 
 ---
 
@@ -479,16 +607,16 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 ### Tool naming convention
 
-All tool names must follow the `{verb}_{entity}` convention using underscores. The verb prefix determines CRUD Restriction Mode behaviour:
+All tool names must follow the `{verb}_{entity}` convention (hyphen variants such as `create-` are also accepted). The verb prefix determines the mutation category and which mode variable governs it:
 
-| Prefix | Category | Suppressed by |
-|--------|----------|---------------|
-| `create_` | WRITE | `QUICKBOOKS_DISABLE_WRITE=true` |
-| `update_` | UPDATE | `QUICKBOOKS_DISABLE_UPDATE=true` |
-| `delete_` | DELETE | `QUICKBOOKS_DISABLE_DELETE=true` |
-| `get_`, `search_`, `read_` | READ | never |
+| Prefix | Category | Governed by |
+|--------|----------|-------------|
+| `create_`, `create-` | WRITE | `QUICKBOOKS_WRITE_MODE` (legacy `QUICKBOOKS_DISABLE_WRITE=true`) |
+| `update_`, `update-` | UPDATE | `QUICKBOOKS_UPDATE_MODE` (legacy `QUICKBOOKS_DISABLE_UPDATE=true`) |
+| `delete_`, `delete-` | DELETE | `QUICKBOOKS_DELETE_MODE` (legacy `QUICKBOOKS_DISABLE_DELETE=true`) |
+| `get_`, `search_`, `read_`, `get-`, `search-`, `read-` | READ | never gated |
 
-New tools that do not follow this convention will not be correctly categorised and may appear or be suppressed unexpectedly.
+A tool name that matches none of these prefixes makes the server refuse to start — unrecognized names are no longer silently treated as read tools. New tools must use one of the prefixes above.
 
 ---
 

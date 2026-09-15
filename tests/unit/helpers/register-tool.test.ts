@@ -1,15 +1,34 @@
 import { describe, it, expect, afterEach, jest } from "@jest/globals";
-import {
-  getCrudCategory,
-  isToolDisabled,
-  RegisterTool,
-} from "../../../src/helpers/register-tool";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { ToolDefinition } from "../../../src/types/tool-definition";
+import { mockQuickbooksClient, mockQuickbooksClientClass } from "../../mocks/quickbooks.mock";
+
+// register-tool loads the approval wrapper, which imports the QuickBooks client.
+jest.unstable_mockModule("../../../src/clients/quickbooks-client", () => ({
+  quickbooksClient: mockQuickbooksClient,
+  QuickbooksClient: mockQuickbooksClientClass,
+}));
+
+const { getCrudCategory, resolveMutationMode, RegisterTool } = await import("../../../src/helpers/register-tool");
+
+const POLICY_ENV = [
+  "QUICKBOOKS_DISABLE_WRITE",
+  "QUICKBOOKS_DISABLE_UPDATE",
+  "QUICKBOOKS_DISABLE_DELETE",
+  "QUICKBOOKS_WRITE_MODE",
+  "QUICKBOOKS_UPDATE_MODE",
+  "QUICKBOOKS_DELETE_MODE",
+  "QUICKBOOKS_APPROVAL_TIMEOUT_SECONDS",
+  "QUICKBOOKS_APPROVAL_AUDIT_LOG",
+  "QUICKBOOKS_APPROVAL_AUDIT_LOG_PATH",
+];
+
+function clearPolicyEnv() {
+  for (const name of POLICY_ENV) delete process.env[name];
+}
 
 // ── getCrudCategory ──────────────────────────────────────────────────────────
-// Verifies that every verb prefix maps to the correct CRUD category string.
 // Uses literal expected values (not re-exported constants) so the test catches
 // both a wrong mapping AND a wrong constant value simultaneously.
 // Covers both underscore (standard) and hyphen (legacy) separator variants.
@@ -24,117 +43,180 @@ describe("getCrudCategory", () => {
   it("returns READ for get_ prefix",      () => expect(getCrudCategory("get_invoice")).toBe("READ"));
   it("returns READ for get- prefix",      () => expect(getCrudCategory("get-vendor")).toBe("READ"));
   it("returns READ for search_ prefix",   () => expect(getCrudCategory("search_customers")).toBe("READ"));
+  it("returns READ for search- prefix",   () => expect(getCrudCategory("search-customers")).toBe("READ"));
   it("returns READ for read_ prefix",     () => expect(getCrudCategory("read_invoice")).toBe("READ"));
+  it("returns READ for read- prefix",     () => expect(getCrudCategory("read-invoice")).toBe("READ"));
+
+  // Unknown verbs must fail closed instead of silently registering as READ.
+  it.each(["void_invoice", "send_invoice", "list_accounts", "invoice", "Create_invoice"])(
+    "throws for unrecognized name %j",
+    (name) => expect(() => getCrudCategory(name)).toThrow(`Tool "${name}" has no recognized verb prefix`)
+  );
 });
 
-// ── isToolDisabled ───────────────────────────────────────────────────────────
-// Verifies that the correct env var name gates each CRUD category.
-// Uses literal env var names ("QUICKBOOKS_DISABLE_WRITE" etc.) so the test catches any
-// mismatch between the documented env var and what the implementation reads.
-// afterEach deletes all three vars to prevent state leaking between tests.
+// ── resolveMutationMode ──────────────────────────────────────────────────────
 
-describe("isToolDisabled", () => {
-  afterEach(() => {
-    delete process.env["QUICKBOOKS_DISABLE_WRITE"];
-    delete process.env["QUICKBOOKS_DISABLE_UPDATE"];
-    delete process.env["QUICKBOOKS_DISABLE_DELETE"];
+describe("resolveMutationMode", () => {
+  afterEach(clearPolicyEnv);
+
+  it.each(["WRITE", "UPDATE", "DELETE"] as const)("defaults %s to allow with no variables set", (category) =>
+    expect(resolveMutationMode(category, {})).toBe("allow"));
+
+  it.each([
+    ["allow", "allow"],
+    ["approval", "approval"],
+    ["disabled", "disabled"],
+    [" Approval ", "approval"],
+    ["DISABLED", "disabled"],
+  ] as const)("parses QUICKBOOKS_UPDATE_MODE=%j", (raw, expected) =>
+    expect(resolveMutationMode("UPDATE", { QUICKBOOKS_UPDATE_MODE: raw })).toBe(expected));
+
+  it("reads the variable for the requested category only", () => {
+    const env = { QUICKBOOKS_WRITE_MODE: "approval", QUICKBOOKS_UPDATE_MODE: "disabled", QUICKBOOKS_DELETE_MODE: "allow" };
+    expect(resolveMutationMode("WRITE", env)).toBe("approval");
+    expect(resolveMutationMode("UPDATE", env)).toBe("disabled");
+    expect(resolveMutationMode("DELETE", env)).toBe("allow");
   });
 
-  // READ tools must never be suppressed regardless of env state.
-  it("returns false for READ tool with no env vars set", () =>
-    expect(isToolDisabled("get_invoice")).toBe(false));
-
-  it("returns false for READ tool even when all DISABLE vars are true", () => {
-    process.env["QUICKBOOKS_DISABLE_WRITE"]  = "true";
-    process.env["QUICKBOOKS_DISABLE_UPDATE"] = "true";
-    process.env["QUICKBOOKS_DISABLE_DELETE"] = "true";
-    expect(isToolDisabled("search_customers")).toBe(false);
+  it.each(["enabled", "true", "approve", "read-only"])("throws for invalid mode %j", (raw) => {
+    expect(() => resolveMutationMode("DELETE", { QUICKBOOKS_DELETE_MODE: raw })).toThrow(
+      `Invalid QUICKBOOKS_DELETE_MODE="${raw}"; expected one of: allow, approval, disabled.`
+    );
   });
 
-  // WRITE — underscore and hyphen variants, both enabled and disabled states.
-  it("returns true for WRITE tool when QUICKBOOKS_DISABLE_WRITE=true",        () => { process.env["QUICKBOOKS_DISABLE_WRITE"]  = "true"; expect(isToolDisabled("create_invoice")).toBe(true); });
-  it("returns false for WRITE tool when QUICKBOOKS_DISABLE_WRITE unset",       () => expect(isToolDisabled("create_invoice")).toBe(false));
-  it("returns true for hyphen WRITE tool when QUICKBOOKS_DISABLE_WRITE=true",  () => { process.env["QUICKBOOKS_DISABLE_WRITE"]  = "true"; expect(isToolDisabled("create-bill")).toBe(true); });
+  // Legacy flags: only the exact string "true" disables a category.
+  it.each([
+    ["WRITE", "QUICKBOOKS_DISABLE_WRITE"],
+    ["UPDATE", "QUICKBOOKS_DISABLE_UPDATE"],
+    ["DELETE", "QUICKBOOKS_DISABLE_DELETE"],
+  ] as const)("maps legacy %s disable=true to disabled", (category, legacy) =>
+    expect(resolveMutationMode(category, { [legacy]: "true" })).toBe("disabled"));
 
-  // UPDATE — underscore and hyphen variants, both enabled and disabled states.
-  it("returns true for UPDATE tool when QUICKBOOKS_DISABLE_UPDATE=true",       () => { process.env["QUICKBOOKS_DISABLE_UPDATE"] = "true"; expect(isToolDisabled("update_customer")).toBe(true); });
-  it("returns false for UPDATE tool when QUICKBOOKS_DISABLE_UPDATE unset",      () => expect(isToolDisabled("update_customer")).toBe(false));
-  it("returns true for hyphen UPDATE tool when QUICKBOOKS_DISABLE_UPDATE=true", () => { process.env["QUICKBOOKS_DISABLE_UPDATE"] = "true"; expect(isToolDisabled("update-vendor")).toBe(true); });
+  it.each(["false", "1", "TRUE", ""])('keeps allow when legacy flag is %j', (raw) =>
+    expect(resolveMutationMode("WRITE", { QUICKBOOKS_DISABLE_WRITE: raw })).toBe("allow"));
 
-  // DELETE — underscore and hyphen variants, both enabled and disabled states.
-  it("returns true for DELETE tool when QUICKBOOKS_DISABLE_DELETE=true",       () => { process.env["QUICKBOOKS_DISABLE_DELETE"] = "true"; expect(isToolDisabled("delete_payment")).toBe(true); });
-  it("returns false for DELETE tool when QUICKBOOKS_DISABLE_DELETE unset",      () => expect(isToolDisabled("delete_payment")).toBe(false));
-  it("returns true for hyphen DELETE tool when QUICKBOOKS_DISABLE_DELETE=true", () => { process.env["QUICKBOOKS_DISABLE_DELETE"] = "true"; expect(isToolDisabled("delete-bill")).toBe(true); });
+  it("treats a blank mode variable as unset and falls back to the legacy flag", () =>
+    expect(resolveMutationMode("WRITE", { QUICKBOOKS_WRITE_MODE: "  ", QUICKBOOKS_DISABLE_WRITE: "true" })).toBe("disabled"));
 
-  // Boundary: only the exact string "true" disables a tool; other truthy-ish values must not.
-  it('returns false when env var is "false"', () => { process.env["QUICKBOOKS_DISABLE_WRITE"] = "false"; expect(isToolDisabled("create_invoice")).toBe(false); });
-  it('returns false when env var is "1"',     () => { process.env["QUICKBOOKS_DISABLE_WRITE"] = "1";     expect(isToolDisabled("create_invoice")).toBe(false); });
+  it("lets an explicit mode win over the legacy flag in both directions", () => {
+    expect(resolveMutationMode("WRITE", { QUICKBOOKS_DISABLE_WRITE: "true", QUICKBOOKS_WRITE_MODE: "allow" })).toBe("allow");
+    expect(resolveMutationMode("WRITE", { QUICKBOOKS_DISABLE_WRITE: "true", QUICKBOOKS_WRITE_MODE: "approval" })).toBe("approval");
+    expect(resolveMutationMode("WRITE", { QUICKBOOKS_DISABLE_WRITE: "false", QUICKBOOKS_WRITE_MODE: "disabled" })).toBe("disabled");
+  });
+
+  it("reads process.env by default", () => {
+    process.env.QUICKBOOKS_DELETE_MODE = "approval";
+    expect(resolveMutationMode("DELETE")).toBe("approval");
+  });
 });
 
 // ── RegisterTool ─────────────────────────────────────────────────────────────
-// Verifies the integration between isToolDisabled and server.tool():
-//   - Enabled tools are registered with the exact fields from ToolDefinition.
-//   - Disabled tools cause RegisterTool to return early without calling server.tool().
 // Uses a minimal mock server object to avoid coupling to the MCP SDK internals.
 
 describe("RegisterTool", () => {
-  afterEach(() => {
-    delete process.env["QUICKBOOKS_DISABLE_WRITE"];
-    delete process.env["QUICKBOOKS_DISABLE_UPDATE"];
-    delete process.env["QUICKBOOKS_DISABLE_DELETE"];
-  });
+  afterEach(clearPolicyEnv);
 
   const schema = z.object({ id: z.string() });
   const handler = jest.fn() as ToolDefinition<typeof schema>["handler"];
   const def = (name: string): ToolDefinition<typeof schema> =>
     ({ name, description: `desc:${name}`, schema, handler });
+  const mockServer = () => ({ tool: jest.fn() });
 
-  // Confirm all four ToolDefinition fields are forwarded to server.tool() unchanged.
-  it("calls server.tool() with all definition fields when enabled", () => {
-    const server = { tool: jest.fn() } as unknown as McpServer;
+  it("calls server.tool() with all definition fields for a READ tool", () => {
+    const server = mockServer();
     const d = def("get_invoice");
-    RegisterTool(server, d);
+    RegisterTool(server as unknown as McpServer, d);
     expect(server.tool).toHaveBeenCalledTimes(1);
     expect(server.tool).toHaveBeenCalledWith(d.name, d.description, { params: d.schema }, d.handler);
   });
 
-  // One test per mutable category to confirm the early-return path is reached.
-  it("skips server.tool() for disabled WRITE tool", () => {
-    process.env["QUICKBOOKS_DISABLE_WRITE"] = "true";
-    const server = { tool: jest.fn() } as unknown as McpServer;
-    RegisterTool(server, def("create_invoice"));
+  it.each([
+    ["legacy flags", { QUICKBOOKS_DISABLE_WRITE: "true", QUICKBOOKS_DISABLE_UPDATE: "true", QUICKBOOKS_DISABLE_DELETE: "true" }],
+    ["disabled modes", { QUICKBOOKS_WRITE_MODE: "disabled", QUICKBOOKS_UPDATE_MODE: "disabled", QUICKBOOKS_DELETE_MODE: "disabled" }],
+    ["approval modes", { QUICKBOOKS_WRITE_MODE: "approval", QUICKBOOKS_UPDATE_MODE: "approval", QUICKBOOKS_DELETE_MODE: "approval" }],
+  ])("registers READ tools with the original handler under %s", (_label, env) => {
+    Object.assign(process.env, env);
+    for (const name of ["search_invoices", "get-bill", "read_item"]) {
+      const server = mockServer();
+      RegisterTool(server as unknown as McpServer, def(name));
+      expect(server.tool).toHaveBeenCalledWith(name, `desc:${name}`, { params: schema }, handler);
+    }
+  });
+
+  describe.each([
+    ["create_invoice", "create-bill", "QUICKBOOKS_WRITE_MODE", "QUICKBOOKS_DISABLE_WRITE"],
+    ["update_customer", "update-vendor", "QUICKBOOKS_UPDATE_MODE", "QUICKBOOKS_DISABLE_UPDATE"],
+    ["delete_payment", "delete-bill", "QUICKBOOKS_DELETE_MODE", "QUICKBOOKS_DISABLE_DELETE"],
+  ])("%s / %s", (underscoreName, hyphenName, modeVar, legacyVar) => {
+    it.each([underscoreName, hyphenName])("is absent when the mode is disabled (%s)", (name) => {
+      process.env[modeVar] = "disabled";
+      const server = mockServer();
+      RegisterTool(server as unknown as McpServer, def(name));
+      expect(server.tool).not.toHaveBeenCalled();
+    });
+
+    it.each([underscoreName, hyphenName])("is absent when the legacy flag is true (%s)", (name) => {
+      process.env[legacyVar] = "true";
+      const server = mockServer();
+      RegisterTool(server as unknown as McpServer, def(name));
+      expect(server.tool).not.toHaveBeenCalled();
+    });
+
+    it("registers the original handler when allowed by default", () => {
+      const server = mockServer();
+      RegisterTool(server as unknown as McpServer, def(underscoreName));
+      expect(server.tool).toHaveBeenCalledWith(underscoreName, `desc:${underscoreName}`, { params: schema }, handler);
+    });
+
+    it("registers the original handler when mode=allow overrides the legacy flag", () => {
+      process.env[legacyVar] = "true";
+      process.env[modeVar] = "allow";
+      const server = mockServer();
+      RegisterTool(server as unknown as McpServer, def(underscoreName));
+      expect(server.tool).toHaveBeenCalledWith(underscoreName, `desc:${underscoreName}`, { params: schema }, handler);
+    });
+
+    it("registers a wrapped handler when mode=approval", () => {
+      process.env[modeVar] = "approval";
+      const server = mockServer();
+      RegisterTool(server as unknown as McpServer, def(underscoreName));
+      expect(server.tool).toHaveBeenCalledTimes(1);
+      const [name, description, shape, registered] = server.tool.mock.calls[0];
+      expect([name, description, shape]).toEqual([underscoreName, `desc:${underscoreName}`, { params: schema }]);
+      expect(typeof registered).toBe("function");
+      expect(registered).not.toBe(handler);
+    });
+  });
+
+  it("throws for a tool name with no recognized prefix", () => {
+    const server = mockServer();
+    expect(() => RegisterTool(server as unknown as McpServer, def("void_invoice"))).toThrow("no recognized verb prefix");
     expect(server.tool).not.toHaveBeenCalled();
   });
 
-  it("skips server.tool() for disabled UPDATE tool", () => {
-    process.env["QUICKBOOKS_DISABLE_UPDATE"] = "true";
-    const server = { tool: jest.fn() } as unknown as McpServer;
-    RegisterTool(server, def("update_customer"));
+  it("throws for an invalid mode", () => {
+    process.env.QUICKBOOKS_UPDATE_MODE = "sometimes";
+    const server = mockServer();
+    expect(() => RegisterTool(server as unknown as McpServer, def("update_customer"))).toThrow("QUICKBOOKS_UPDATE_MODE");
     expect(server.tool).not.toHaveBeenCalled();
   });
 
-  it("skips server.tool() for disabled DELETE tool", () => {
-    process.env["QUICKBOOKS_DISABLE_DELETE"] = "true";
-    const server = { tool: jest.fn() } as unknown as McpServer;
-    RegisterTool(server, def("delete_payment"));
+  it.each([
+    ["an approval-mode mutation", "create_invoice", { QUICKBOOKS_WRITE_MODE: "approval" }],
+    ["an allow-mode mutation", "create_invoice", {}],
+    ["a disabled mutation", "delete_payment", { QUICKBOOKS_DELETE_MODE: "disabled" }],
+    ["a READ tool", "get_invoice", {}],
+  ])("throws for invalid approval configuration when registering %s", (_label, name, env) => {
+    Object.assign(process.env, env, { QUICKBOOKS_APPROVAL_TIMEOUT_SECONDS: "0" });
+    const server = mockServer();
+    expect(() => RegisterTool(server as unknown as McpServer, def(name))).toThrow("QUICKBOOKS_APPROVAL_TIMEOUT_SECONDS");
     expect(server.tool).not.toHaveBeenCalled();
   });
 
-  // READ tools must register even when all three DISABLE vars are set.
-  it("registers READ tool even when all DISABLE vars are true", () => {
-    process.env["QUICKBOOKS_DISABLE_WRITE"]  = "true";
-    process.env["QUICKBOOKS_DISABLE_UPDATE"] = "true";
-    process.env["QUICKBOOKS_DISABLE_DELETE"] = "true";
-    const server = { tool: jest.fn() } as unknown as McpServer;
-    RegisterTool(server, def("search_invoices"));
-    expect(server.tool).toHaveBeenCalledTimes(1);
-  });
-
-  // Confirm the legacy hyphen separator is handled by the early-return path.
-  it("skips hyphen-prefixed WRITE tool when QUICKBOOKS_DISABLE_WRITE=true", () => {
-    process.env["QUICKBOOKS_DISABLE_WRITE"] = "true";
-    const server = { tool: jest.fn() } as unknown as McpServer;
-    RegisterTool(server, def("create-bill"));
+  it("throws for an audit log path without the audit log flag in allow mode", () => {
+    process.env.QUICKBOOKS_APPROVAL_AUDIT_LOG_PATH = "/tmp/approvals.jsonl";
+    const server = mockServer();
+    expect(() => RegisterTool(server as unknown as McpServer, def("update_customer"))).toThrow("QUICKBOOKS_APPROVAL_AUDIT_LOG=true");
     expect(server.tool).not.toHaveBeenCalled();
   });
 });

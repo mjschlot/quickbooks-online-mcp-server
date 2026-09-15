@@ -105,7 +105,7 @@ jest.unstable_mockModule('fs', () => ({
   },
 }));
 
-const { quickbooksClient } = await import('../../../src/clients/quickbooks-client');
+const { quickbooksClient, QuickbooksClient } = await import('../../../src/clients/quickbooks-client');
 
 // Polls until the OAuth callback handler has been registered by startOAuthFlow.
 async function untilCallbackRegistered(timeoutMs = 2000): Promise<void> {
@@ -127,6 +127,26 @@ async function untilAuthorizeUriCalled(client: MockOAuth, timeoutMs = 2000): Pro
     await new Promise((resolve) => setImmediate(resolve));
   }
 }
+
+// Runs before the authenticate tests, which leave an interactive flow pending.
+describe('QuickbooksClient.getRealmId', () => {
+  it('authenticates when needed and returns only the realm ID', async () => {
+    refreshDispatch.mockResolvedValueOnce({ token: { access_token: 'access-0', expires_in: 3600 } });
+
+    await expect(QuickbooksClient.getRealmId()).resolves.toBe('12345');
+    await expect(QuickbooksClient.getRealmId()).resolves.toBe('12345');
+
+    // The second call reuses the fresh token rather than refreshing again.
+    expect(refreshDispatch).toHaveBeenCalledTimes(1);
+  });
+
+  it('propagates an authentication failure', async () => {
+    (quickbooksClient as unknown as { accessTokenExpiry?: Date }).accessTokenExpiry = new Date(0);
+    refreshDispatch.mockRejectedValueOnce(new Error('Request failed with status code 503'));
+
+    await expect(QuickbooksClient.getRealmId()).rejects.toThrow('status code 503');
+  });
+});
 
 describe('QuickbooksClient.authenticate', () => {
   it('refreshes silently without starting the interactive flow when the refresh token works', async () => {

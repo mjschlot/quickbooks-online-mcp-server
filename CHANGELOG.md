@@ -5,6 +5,23 @@ All notable changes to the QuickBooks Online MCP Server are documented in this f
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `QUICKBOOKS_WRITE_MODE`, `QUICKBOOKS_UPDATE_MODE`, and `QUICKBOOKS_DELETE_MODE`, each `allow` | `approval` | `disabled`, controlling registration and approval requirements for `create_*`, `update_*`, and `delete_*` tools respectively. Legacy `QUICKBOOKS_DISABLE_*` flags remain supported.
+- Server-enforced human approval for mutations in `approval` mode, using MCP elicitation: the server checks client support, canonicalizes and hashes the exact call, and requires a single-use, time-limited approval before sending any request to QuickBooks.
+- Approvals bind the realm ID the QuickBooks client will use, re-checked before execution, and for `create_attachable` the SHA-256 of the file content, which is read or downloaded into memory before the prompt and uploaded from that snapshot.
+- Optional JSON Lines audit log for approval-mode calls (`QUICKBOOKS_APPROVAL_AUDIT_LOG`, `QUICKBOOKS_APPROVAL_AUDIT_LOG_PATH`), recording outcomes and a payload hash rather than arguments; `error` text has credentials and argument string values of 6 or more characters redacted.
+- In `approval` mode, `create_attachable` downloads `file_url` content (a GET to that URL, no QuickBooks request) before the prompt; cancelling the tool call aborts the download.
+- Approval prompts always show inline `base64_content`, and any other string longer than 4,096 characters, as its length and SHA-256; the payload hash still covers the full value.
+- Audit records for `unsupported-client` outcomes and argument canonicalization failures have `payloadHash` and `realmId` set to `null`.
+
+### Changed
+
+- A tool name that does not match a known verb prefix (`create_`/`update_`/`delete_`/`get_`/`search_`/`read_`, or their hyphen variants) now causes a startup error instead of being silently treated as a read tool.
+- `file_url` downloads are written to a new temp file with mode `0600` that never replaces an existing path.
+
 ## [0.0.1] - 2024-01-13
 
 ### Summary
